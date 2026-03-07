@@ -1,0 +1,343 @@
+Arquitectura Mejorada — Radar de Oportunidades
+
+Arquitectura general:
+
+                ┌─────────────────────────┐
+                │        Frontend         │
+                │        Angular          │
+                │   Dashboard + Filters   │
+                └─────────────┬───────────┘
+                              │
+                              ▼
+                   ┌──────────────────┐
+                   │      API         │
+                   │   FastAPI /     │
+                   │   Spring Boot   │
+                   └───────┬─────────┘
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                                 ▼
+  ┌───────────────┐                 ┌────────────────┐
+  │ Auth Service  │                 │ Billing Service │
+  │ JWT / OAuth2  │                 │ Stripe          │
+  └───────────────┘                 └────────────────┘
+
+                           │
+                           ▼
+                 ┌────────────────────┐
+                 │ Opportunity Engine │
+                 │  ROI + Profit calc │
+                 └─────────┬──────────┘
+                           │
+                           ▼
+                 ┌────────────────────┐
+                 │ Product Resolution │
+                 │ (Matching Engine)  │
+                 └─────────┬──────────┘
+                           │
+                           ▼
+                  ┌──────────────────┐
+                  │ Normalization    │
+                  │ Clean titles     │
+                  └─────────┬────────┘
+                           │
+                           ▼
+                   ┌─────────────────┐
+                   │ Scraper Workers │
+                   │ Playwright Pool │
+                   └─────────┬───────┘
+                             │
+                             ▼
+                    ┌────────────────┐
+                    │ Proxy Manager  │
+                    │ IP rotation    │
+                    └─────────┬──────┘
+                              │
+                              ▼
+                       ┌──────────────┐
+                       │ Marketplaces │
+                       └──────────────┘
+1️⃣ Scraper Cluster (Recolección de datos)
+
+Scrapers distribuidos recolectan listings de:
+
+Mercado Libre
+
+eBay
+
+Facebook Marketplace
+
+Tecnologías
+
+Playwright
+
+Scrapy
+
+Puppeteer
+
+Arquitectura:
+
+scraper worker
+scraper worker
+scraper worker
+scraper worker
+
+Todos envían datos a una cola.
+
+2️⃣ Proxy Manager (crítico)
+
+Sistema encargado de:
+
+rotar IPs
+
+evitar bloqueos
+
+distribuir requests
+
+scraper
+   ↓
+proxy pool
+   ↓
+marketplace
+
+Puede usar:
+
+Bright Data
+
+Oxylabs
+
+Smartproxy
+
+3️⃣ Message Queue
+
+Necesaria para desacoplar scraping del procesamiento.
+
+Tecnologías:
+
+Redis Streams
+
+RabbitMQ
+
+Kafka (si escala mucho)
+
+Flujo:
+
+scrapers
+   ↓
+raw listing queue
+   ↓
+processing workers
+4️⃣ Normalization Service
+
+Limpia los datos antes de procesarlos.
+
+Ejemplo:
+
+Sony WH-1000XM4
+Sony WH1000XM4
+Sony XM4
+
+Resultado:
+
+sony wh1000xm4
+
+Procesos:
+
+lower case
+
+remove symbols
+
+remove stop words
+
+tokenización
+
+5️⃣ Product Resolution Engine (EL VERDADERO CORE)
+
+Aquí ocurre el matching de productos.
+
+Sistema híbrido:
+
+Nivel 1 — Identificador exacto
+UPC
+EAN
+MPN
+
+si existe → match inmediato.
+
+Nivel 2 — fingerprint del producto
+
+Se genera una firma:
+
+brand + model + category
+
+ejemplo:
+
+sony + wh1000xm4 + headphones
+Nivel 3 — embeddings
+
+vectorización:
+
+title → embedding vector
+
+comparación:
+
+cosine similarity
+6️⃣ Opportunity Engine
+
+Calcula si hay arbitrage.
+
+Fórmula:
+
+profit = sell_price - buy_price - fees
+ROI = profit / buy_price
+
+Reglas configurables:
+
+profit > $30
+ROI > 25%
+
+Si se cumple:
+
+create opportunity
+7️⃣ Alert System
+
+Envía alertas cuando aparece una oportunidad.
+
+Canales:
+
+Telegram
+
+email
+
+dashboard
+
+Ejemplo:
+
+Sony WH1000XM4
+buy: $120
+sell: $200
+profit: $60
+ROI: 50%
+8️⃣ Databases
+
+Arquitectura híbrida.
+
+PostgreSQL
+
+datos estructurados:
+
+usuarios
+
+oportunidades
+
+configuraciones
+
+alertas
+
+Elasticsearch
+
+búsqueda rápida:
+
+productos
+
+títulos
+
+listings
+
+Vector Database
+
+para embeddings.
+
+Opciones:
+
+pgvector
+
+Pinecone
+
+Milvus
+
+9️⃣ Frontend
+
+Panel Angular con:
+
+opportunities
+profit
+ROI
+marketplace
+filters
+alerts
+
+Funciones:
+
+filtros avanzados
+
+historial
+
+tracking de precios
+
+🔟 Infraestructura
+
+Contenerización:
+
+Docker
+
+orquestación:
+
+Kubernetes
+
+Cloud:
+
+Amazon Web Services
+
+Google Cloud
+
+1️⃣1️⃣ Seguridad y resiliencia
+
+Agregar:
+
+circuit breaker
+
+para servicios críticos.
+
+retry system
+retry
+retry
+dead letter queue
+rate limiter
+
+para evitar bloqueos.
+
+1️⃣2️⃣ Escalabilidad
+
+Cuando el sistema crece:
+
+scraper cluster
+processing cluster
+API cluster
+
+Cada componente escala independientemente.
+
+🚀 Roadmap realista
+semana 1 (MVP)
+1 scraper
+price comparison
+alertas telegram
+mes 1
+normalización
+matching básico
+dashboard
+fase SaaS
+usuarios
+suscripciones
+pagos
+API
+💡 Mi impresión final
+
+Esta arquitectura:
+
+✔ es realista
+✔ es escalable
+✔ evita los errores comunes
+✔ permite construir un SaaS
+
+No es trivial, pero está dentro del alcance de un desarrollador backend serio.

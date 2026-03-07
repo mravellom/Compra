@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-surface-600;
+  }
+  body {
+    @apply antialiased;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface-800 rounded-xl border border-surface-600 p-5 transition-all duration-200;
+  }
+  .card:hover {
+    @apply border-accent-blue/40 shadow-lg shadow-accent-blue/5;
+  }
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  .btn-primary {
+    @apply bg-accent-blue hover:bg-accent-blue/80 text-white font-medium py-2 px-4 rounded-lg transition-colors;
+  }
+  .input-dark {
+    @apply bg-surface-700 border border-surface-600 rounded-lg px-3 py-2 text-sm text-gray-200
+           placeholder-gray-500 focus:outline-none focus:border-accent-blue/50 focus:ring-1 focus:ring-accent-blue/30;
+  }
+}
+
+/* Custom range slider */
+input[type="range"] {
+  @apply w-full h-1.5 rounded-full appearance-none cursor-pointer bg-surface-600;
+}
+input[type="range"]::-webkit-slider-thumb {
+  @apply appearance-none w-4 h-4 rounded-full bg-accent-blue border-2 border-surface-800;
+}
