@@ -56,6 +56,19 @@ async def process_message(msg_id: str, data: dict) -> None:
     price = float(price_str)
     normalized = normalize_title(title)
 
+    # Extract enhanced metadata
+    condition = data.get("condition", "new")
+    seller_name = data.get("seller_name") or None
+    seller_rating_str = data.get("seller_rating", "")
+    seller_rating = float(seller_rating_str) if seller_rating_str else None
+    reviews_count = int(data.get("reviews_count", "0") or "0")
+    sales_count = int(data.get("sales_count", "0") or "0")
+    stock_str = data.get("stock_available", "")
+    stock_available = int(stock_str) if stock_str else None
+    is_free_shipping = data.get("is_free_shipping", "False").lower() == "true"
+    shipping_str = data.get("shipping_price", "")
+    shipping_price = float(shipping_str) if shipping_str else None
+
     # Resolver producto (match o crear nuevo)
     match = await resolve_product(title)
 
@@ -71,6 +84,14 @@ async def process_message(msg_id: str, data: dict) -> None:
         image_url=image_url,
         similarity=match.similarity,
         scraped_at=scraped_at,
+        condition=condition,
+        seller_name=seller_name,
+        seller_rating=seller_rating,
+        reviews_count=reviews_count,
+        sales_count=sales_count,
+        stock_available=stock_available,
+        is_free_shipping=is_free_shipping,
+        shipping_price=shipping_price,
     )
 
     action = "CREATED" if match.is_new else "MATCHED"

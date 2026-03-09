@@ -57,10 +57,45 @@ import { Opportunity } from '../../models/opportunity.model';
         </div>
       </div>
 
+      <!-- Score badge + confidence -->
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold border-2"
+               [class]="scoreBorderClass">
+            {{ opp.opportunity_score | number:'1.0-0' }}
+          </div>
+          <div>
+            <p class="text-[10px] text-gray-500 uppercase">Score</p>
+            <span class="text-xs font-medium px-1.5 py-0.5 rounded"
+                  [class]="confidenceBadgeClass">
+              {{ opp.confidence_level }}
+            </span>
+          </div>
+        </div>
+        <div class="text-right space-y-1">
+          <div class="flex items-center gap-1.5 text-[11px] text-gray-500">
+            <span>Vel.</span>
+            <div class="w-12 h-1.5 bg-surface-600 rounded-full overflow-hidden">
+              <div class="h-full bg-accent-blue rounded-full" [style.width.%]="opp.sales_velocity_score"></div>
+            </div>
+          </div>
+          <div class="flex items-center gap-1.5 text-[11px] text-gray-500">
+            <span>Comp.</span>
+            <div class="w-12 h-1.5 bg-surface-600 rounded-full overflow-hidden">
+              <div class="h-full rounded-full" [class]="opp.competition_score > 70 ? 'bg-accent-red' : 'bg-accent-green'"
+                   [style.width.%]="opp.competition_score"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Fees breakdown -->
       <div class="flex gap-4 text-[11px] text-gray-500">
         <span>Comisiones: \${{ opp.fees | number:'1.2-2' }}</span>
         <span>Envio: \${{ opp.shipping_cost | number:'1.2-2' }}</span>
+        @if (opp.import_tax > 0) {
+          <span>Tax: \${{ opp.import_tax | number:'1.2-2' }}</span>
+        }
       </div>
 
       <!-- Action links -->
@@ -85,5 +120,20 @@ export class OpportunityCardComponent {
     if (this.opp.roi >= 0.5) return 'text-accent-green';
     if (this.opp.roi >= 0.25) return 'text-accent-yellow';
     return 'text-accent-red';
+  }
+
+  get scoreBorderClass(): string {
+    const s = this.opp.opportunity_score;
+    if (s >= 75) return 'border-accent-green text-accent-green';
+    if (s >= 50) return 'border-accent-yellow text-accent-yellow';
+    return 'border-gray-600 text-gray-400';
+  }
+
+  get confidenceBadgeClass(): string {
+    switch (this.opp.confidence_level) {
+      case 'high': return 'bg-accent-green/20 text-accent-green';
+      case 'medium': return 'bg-accent-yellow/20 text-accent-yellow';
+      default: return 'bg-gray-700 text-gray-400';
+    }
   }
 }

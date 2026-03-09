@@ -7,6 +7,7 @@ from pgvector.asyncpg import register_vector  # noqa: F401
 from .db import get_pool
 from .embeddings import generate_embedding
 from .normalizer import extract_brand, extract_model, normalize_title
+from .categorizer import classify_product
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +63,17 @@ async def resolve_product(raw_title: str) -> MatchResult:
             )
 
         # No match -> crear nuevo master product
+        category = classify_product(normalized)
         new_id = await conn.fetchval(
             """
-            INSERT INTO master_products (canonical_name, brand, model, embedding)
-            VALUES ($1, $2, $3, $4::vector)
+            INSERT INTO master_products (canonical_name, brand, model, category, embedding)
+            VALUES ($1, $2, $3, $4, $5::vector)
             RETURNING id
             """,
-            normalized, brand, model, np.array(embedding),
+            normalized, brand, model, category, np.array(embedding),
         )
 
-        logger.info("NEW PRODUCT: '%s' (id=%d, brand=%s, model=%s)", normalized, new_id, brand, model)
+        logger.info("NEW PRODUCT: '%s' (id=%d, brand=%s, model=%s, cat=%s)", normalized, new_id, brand, model, category)
         return MatchResult(
             master_product_id=new_id,
             canonical_name=normalized,
@@ -91,18 +93,42 @@ async def save_listing(
     image_url: str | None,
     similarity: float,
     scraped_at: str | None,
+    condition: str = "new",
+    seller_name: str | None = None,
+    seller_rating: float | None = None,
+    reviews_count: int = 0,
+    sales_count: int = 0,
+    stock_available: int | None = None,
+    is_free_shipping: bool = False,
+    shipping_price: float | None = None,
 ) -> int:
-    """Guarda el listing vinculado al master product."""
+    """Guarda el listing vinculado al master product y registra precio en historial."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetchval(
+        listing_id = await conn.fetchval(
             """
             INSERT INTO product_listings
                 (master_product_id, title, normalized_title, price, currency,
-                 url, marketplace_id, image_url, similarity_score, scraped_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz)
+                 url, marketplace_id, image_url, similarity_score, scraped_at,
+                 condition, seller_name, seller_rating, reviews_count, sales_count,
+                 stock_available, is_free_shipping, shipping_price)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz,
+                    $11, $12, $13, $14, $15, $16, $17, $18)
             RETURNING id
             """,
             master_product_id, title, normalized_title, price, currency,
             url, marketplace_id, image_url, similarity, scraped_at,
+            condition, seller_name, seller_rating, reviews_count, sales_count,
+            stock_available, is_free_shipping, shipping_price,
         )
+
+        # Record price history
+        await conn.execute(
+            """
+            INSERT INTO price_history (listing_url, marketplace_id, price, currency)
+            VALUES ($1, $2, $3, $4)
+            """,
+            url, marketplace_id, price, currency,
+        )
+
+        return listing_id

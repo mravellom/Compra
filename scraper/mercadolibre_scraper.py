@@ -91,6 +91,37 @@ class MercadoLibreScraper:
         if img_el:
             image_url = img_el.get("src") or img_el.get("data-src")
 
+        # Reviews count
+        reviews_count = 0
+        reviews_el = item.select_one(".poly-reviews__total")
+        if reviews_el:
+            reviews_text = re.sub(r"[^\d]", "", reviews_el.get_text(strip=True))
+            reviews_count = int(reviews_text) if reviews_text else 0
+
+        # Star rating
+        seller_rating = None
+        rating_el = item.select_one(".poly-reviews__rating")
+        if rating_el:
+            m = re.search(r"([\d.]+)", rating_el.get_text(strip=True))
+            if m:
+                seller_rating = float(m.group(1))
+
+        # Free shipping
+        is_free_shipping = bool(
+            item.select_one(".poly-component__shipping .poly-component__shipped-text")
+            or item.select_one("[class*='free-shipping']")
+        )
+
+        # Condition from title
+        condition = self._detect_condition(title)
+
+        # Sales count from "vendidos" text
+        sales_count = 0
+        sold_el = item.select_one(".poly-component__sold")
+        if sold_el:
+            sold_text = re.sub(r"[^\d]", "", sold_el.get_text(strip=True))
+            sales_count = int(sold_text) if sold_text else 0
+
         return RawListing(
             title=title,
             price=price,
@@ -98,7 +129,21 @@ class MercadoLibreScraper:
             url=url,
             marketplace_id=self.marketplace_id,
             image_url=image_url,
+            reviews_count=reviews_count,
+            seller_rating=seller_rating,
+            is_free_shipping=is_free_shipping,
+            condition=condition,
+            sales_count=sales_count,
         )
+
+    @staticmethod
+    def _detect_condition(title: str) -> str:
+        lower = title.lower()
+        if any(w in lower for w in ("reacondicionado", "refurbished", "renewed", "renovado")):
+            return "refurbished"
+        if any(w in lower for w in ("usado", "used", "pre-owned", "segunda mano")):
+            return "used"
+        return "new"
 
     @staticmethod
     def _parse_price(text: str) -> float | None:

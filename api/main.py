@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .routes.alerts import router as alerts_router
+from .routes.categories import router as categories_router
 from .routes.opportunities import router as opportunities_router
 
 logging.basicConfig(
@@ -27,6 +28,7 @@ app.add_middleware(
 
 app.include_router(opportunities_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
+app.include_router(categories_router, prefix="/api/v1")
 
 
 @app.get("/health")

@@ -39,6 +39,10 @@ import { OpportunityDetailComponent } from '../opportunity-detail/opportunity-de
             </h2>
           </div>
           <div class="flex gap-2 text-sm">
+            <button (click)="sortBy = 'score'" class="px-3 py-1 rounded-lg transition-colors"
+                    [class]="sortBy === 'score' ? 'bg-accent-blue/20 text-accent-blue' : 'text-gray-500 hover:text-gray-300'">
+              Score
+            </button>
             <button (click)="sortBy = 'roi'" class="px-3 py-1 rounded-lg transition-colors"
                     [class]="sortBy === 'roi' ? 'bg-accent-blue/20 text-accent-blue' : 'text-gray-500 hover:text-gray-300'">
               ROI
@@ -89,7 +93,7 @@ export class DashboardComponent implements OnInit {
   @ViewChild(SidebarComponent) sidebar!: SidebarComponent;
 
   svc = inject(OpportunityService);
-  sortBy: 'roi' | 'profit' | 'recent' = 'roi';
+  sortBy: 'score' | 'roi' | 'profit' | 'recent' = 'score';
 
   ngOnInit(): void {
     this.svc.loadOpportunities();
@@ -107,6 +111,8 @@ export class DashboardComponent implements OnInit {
   sorted() {
     const opps = [...this.svc.filteredOpportunities()];
     switch (this.sortBy) {
+      case 'score':
+        return opps.sort((a, b) => b.opportunity_score - a.opportunity_score);
       case 'roi':
         return opps.sort((a, b) => b.roi - a.roi);
       case 'profit':

@@ -78,6 +78,27 @@ class AmazonScraper:
         if img_el:
             image_url = img_el.get("src") or img_el.get("data-src")
 
+        # Reviews count
+        reviews_count = 0
+        reviews_el = item.select_one(".a-size-base.s-underline-text")
+        if reviews_el:
+            reviews_text = re.sub(r"[^\d]", "", reviews_el.get_text(strip=True))
+            reviews_count = int(reviews_text) if reviews_text else 0
+
+        # Star rating
+        seller_rating = None
+        rating_el = item.select_one(".a-icon-alt")
+        if rating_el:
+            m = re.search(r"([\d.]+)", rating_el.get_text(strip=True))
+            if m:
+                seller_rating = float(m.group(1))
+
+        # Condition detection from title
+        condition = self._detect_condition(title)
+
+        # Free shipping badge
+        is_free_shipping = bool(item.select_one(".a-color-base.a-text-bold"))
+
         return RawListing(
             title=title,
             price=price,
@@ -85,7 +106,20 @@ class AmazonScraper:
             url=url,
             marketplace_id=self.marketplace_id,
             image_url=image_url,
+            reviews_count=reviews_count,
+            seller_rating=seller_rating,
+            condition=condition,
+            is_free_shipping=is_free_shipping,
         )
+
+    @staticmethod
+    def _detect_condition(title: str) -> str:
+        lower = title.lower()
+        if any(w in lower for w in ("reacondicionado", "refurbished", "renewed", "renovado")):
+            return "refurbished"
+        if any(w in lower for w in ("usado", "used", "pre-owned", "segunda mano")):
+            return "used"
+        return "new"
 
     @staticmethod
     def _parse_price(text: str) -> float | None:

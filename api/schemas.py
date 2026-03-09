@@ -11,6 +11,7 @@ class OpportunityOut(BaseModel):
     product_name: str
     buy_price: float
     sell_price: float
+    estimated_sell_price: Optional[float] = None
     fees: float
     shipping_cost: float
     net_profit: float
@@ -22,6 +23,43 @@ class OpportunityOut(BaseModel):
     image_url: Optional[str] = None
     status: str
     created_at: datetime
+
+    # Production scoring
+    marketplace_fee: float = 0
+    payment_fee: float = 0
+    import_tax: float = 0
+    domestic_shipping: float = 0
+    international_shipping: float = 0
+    sales_velocity_score: float = 0
+    competition_score: float = 0
+    price_stability_score: float = 0
+    opportunity_score: float = 0
+    confidence_level: str = "low"
+    competitor_count: int = 0
+    avg_market_price: Optional[float] = None
+    lowest_competitor_price: Optional[float] = None
+
+    # Market depth
+    market_depth_score: float = 0
+    estimated_daily_sales: float = 0
+    estimated_monthly_sales: float = 0
+    scalability_level: str = "low"
+
+    # Demand trend
+    demand_trend_score: float = 50
+    demand_trend_label: str = "stable"
+
+    # Lifecycle tracking
+    decay_rate: float = 0
+    lifetime_hours: float = 0
+    urgency_score: float = 50
+    lifecycle_label: str = "fresh"
+
+    # Capital efficiency
+    capital_required: float = 0
+    capital_efficiency_score: float = 0
+    capital_tier: str = "medium"
+    recommended_quantity: int = 1
 
     model_config = {"from_attributes": True}
 
@@ -79,6 +117,25 @@ class OpportunityDetail(OpportunityOut):
     brand: Optional[str] = None
     model: Optional[str] = None
     related_listings: list[RelatedListing] = []
+
+
+# --- Category Arbitrage ---
+
+class CategoryArbitrageOut(BaseModel):
+    category_name: str
+    total_products: int
+    opportunity_count: int
+    avg_profit: float
+    avg_roi: float
+    avg_sales_velocity: float
+    avg_competition: float
+    avg_demand_trend: float = 50
+    best_roi: float
+    best_profit: float
+    category_score: float
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 # --- Stats ---
