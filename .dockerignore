@@ -1,23 +1,13 @@
-# Python
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.venv/
-
-# Env
 .env
-
-# Node
+.git/
 node_modules/
 frontend/node_modules/
-
-# Logs
-*.log
-
-# Build
 frontend/dist/
 frontend/.angular/
-
-# OS
+*.log
 .DS_Store
+tests/
+pytest.ini
