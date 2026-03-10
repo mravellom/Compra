@@ -21,3 +21,4 @@ frontend/.angular/
 
 # OS
 .DS_Store
+venv/

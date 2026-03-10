@@ -191,6 +191,8 @@ async def list_opportunities(
             capital_efficiency_score=opp.capital_efficiency_score or 0,
             capital_tier=opp.capital_tier or "medium",
             recommended_quantity=opp.recommended_quantity or 1,
+            risk_score=opp.risk_score or 50,
+            confidence_score=opp.confidence_score or 50,
         ))
 
     return opportunities

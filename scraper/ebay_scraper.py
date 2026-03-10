@@ -1,10 +1,10 @@
 import logging
-import re
 from urllib.parse import quote_plus
 
 import httpx
 from bs4 import BeautifulSoup
 
+from .price_parser import extract_ebay_price, normalize_price, validate_price
 from .schemas import RawListing
 
 logger = logging.getLogger(__name__)
@@ -60,13 +60,13 @@ class EbayScraper:
         if not title or title.lower() == "shop on ebay":
             return None
 
-        # Price
-        price_el = item.select_one(".s-item__price")
-        if not price_el:
-            return None
-        price_text = price_el.get_text(strip=True)
-        price = self._parse_price(price_text)
+        # Price — use robust extractor
+        price = extract_ebay_price(item)
         if price is None:
+            return None
+
+        currency = self._parse_currency(item)
+        if not validate_price(price, currency, self.marketplace_id, title):
             return None
 
         # URL
@@ -84,27 +84,18 @@ class EbayScraper:
         return RawListing(
             title=title,
             price=price,
-            currency=self._parse_currency(price_text),
+            currency=currency,
             url=url,
             marketplace_id=self.marketplace_id,
             image_url=image_url,
         )
 
     @staticmethod
-    def _parse_price(text: str) -> float | None:
-        """Extrae el precio numerico de un string como '$29.99' o '$10.00 to $20.00'."""
-        match = re.search(r"[\d,]+\.?\d*", text.replace(",", ""))
-        if not match:
-            return None
-        try:
-            return float(match.group())
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _parse_currency(text: str) -> str:
-        if "$" in text:
+    def _parse_currency(item) -> str:
+        price_el = item.select_one(".s-item__price")
+        if not price_el:
             return "USD"
+        text = price_el.get_text(strip=True)
         if "EUR" in text or "\u20ac" in text:
             return "EUR"
         if "GBP" in text or "\u00a3" in text:

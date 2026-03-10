@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .routes.alerts import router as alerts_router
 from .routes.categories import router as categories_router
+from .routes.discovery import router as discovery_router
 from .routes.opportunities import router as opportunities_router
 
 logging.basicConfig(
@@ -34,8 +35,34 @@ app.add_middleware(
 app.include_router(opportunities_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
 app.include_router(categories_router, prefix="/api/v1")
+app.include_router(discovery_router, prefix="/api/v1")
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/health/pipeline")
+async def pipeline_health():
+    """Detailed pipeline health check with stream metrics."""
+    try:
+        from infra.monitor import PipelineMonitor
+        monitor = PipelineMonitor()
+        snapshot = await monitor.collect_snapshot()
+        return {
+            "status": snapshot.overall_status,
+            "dlq_length": snapshot.dlq_length,
+            "alerts": snapshot.alerts,
+            "streams": {
+                name: {
+                    "length": h.length,
+                    "consumer_lag": h.consumer_lag,
+                    "consumers": h.consumers,
+                    "status": h.status,
+                }
+                for name, h in snapshot.streams.items()
+            },
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}

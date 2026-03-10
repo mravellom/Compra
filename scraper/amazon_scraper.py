@@ -2,24 +2,28 @@ import logging
 import re
 from urllib.parse import quote_plus
 
-import httpx
 from bs4 import BeautifulSoup
 
+from .price_parser import extract_amazon_price, validate_price
 from .schemas import RawListing
+from .stealth import StealthSession, ProxyPool
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 AMAZON_SEARCH_URL = "https://www.amazon.com.mx/s?k={query}"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-}
-
 
 class AmazonScraper:
     marketplace_id = "amazon"
+
+    def __init__(
+        self,
+        rate_limiter: RateLimiter | None = None,
+        proxy_pool: ProxyPool | None = None,
+    ):
+        self._rate_limiter = rate_limiter
+        self._proxy_pool = proxy_pool
 
     async def scrape(self, search_term: str, max_results: int = 20) -> list[RawListing]:
         listings: list[RawListing] = []
@@ -27,9 +31,13 @@ class AmazonScraper:
         logger.info("Fetching %s", url)
 
         try:
-            async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
+            async with StealthSession(
+                proxy_pool=self._proxy_pool,
+                rate_limiter=self._rate_limiter,
+                accept_language="es-MX,es;q=0.9,en;q=0.8",
+                base_delay=2.5,
+            ) as session:
+                resp = await session.fetch(url, domain="amazon")
         except Exception:
             logger.error("Error fetching Amazon for '%s'", search_term, exc_info=True)
             return []
@@ -57,13 +65,12 @@ class AmazonScraper:
         if not title:
             return None
 
-        # Price
-        price_el = item.select_one(".a-price .a-offscreen")
-        if not price_el:
-            return None
-        price_text = price_el.get_text(strip=True)
-        price = self._parse_price(price_text)
+        # Price — use robust extractor with split-element fallback
+        price = extract_amazon_price(item)
         if price is None:
+            return None
+
+        if not validate_price(price, "MXN", self.marketplace_id, title):
             return None
 
         # URL from ASIN
@@ -120,14 +127,3 @@ class AmazonScraper:
         if any(w in lower for w in ("usado", "used", "pre-owned", "segunda mano")):
             return "used"
         return "new"
-
-    @staticmethod
-    def _parse_price(text: str) -> float | None:
-        """Parsea precios como '$5,199.00' o '$12,498.30'."""
-        cleaned = re.sub(r"[^\d.]", "", text)
-        if not cleaned:
-            return None
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None

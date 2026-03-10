@@ -2,10 +2,12 @@ import logging
 import re
 from urllib.parse import quote_plus
 
-import httpx
 from bs4 import BeautifulSoup
 
+from .price_parser import extract_ml_price, validate_price
 from .schemas import RawListing
+from .stealth import StealthSession, ProxyPool
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -25,16 +27,19 @@ ML_SITES = {
 
 
 class MercadoLibreScraper:
-    def __init__(self, site_id: str = "mercadolibre_ar"):
+    def __init__(
+        self,
+        site_id: str = "mercadolibre_ar",
+        rate_limiter: RateLimiter | None = None,
+        proxy_pool: ProxyPool | None = None,
+    ):
         config = ML_SITES[site_id]
         self.marketplace_id = site_id
         self._search_url = config["url"]
         self._currency = config["currency"]
-        self._headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": config["lang"],
-        }
+        self._lang = config["lang"]
+        self._rate_limiter = rate_limiter
+        self._proxy_pool = proxy_pool
 
     async def scrape(self, search_term: str, max_results: int = 20) -> list[RawListing]:
         listings: list[RawListing] = []
@@ -43,9 +48,14 @@ class MercadoLibreScraper:
         logger.info("Fetching %s", url)
 
         try:
-            async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, timeout=30) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
+            async with StealthSession(
+                proxy_pool=self._proxy_pool,
+                rate_limiter=self._rate_limiter,
+                accept_language=self._lang,
+                base_delay=2.0,
+                skip_accept_encoding=True,
+            ) as session:
+                resp = await session.fetch(url, domain=self.marketplace_id)
         except Exception:
             logger.error("Error fetching %s for '%s'", self.marketplace_id, search_term, exc_info=True)
             return []
@@ -72,11 +82,12 @@ class MercadoLibreScraper:
         if not title:
             return None
 
-        price_el = item.select_one(".andes-money-amount__fraction")
-        if not price_el:
-            return None
-        price = self._parse_price(price_el.get_text(strip=True))
+        # Price — use robust extractor that handles fraction + cents elements
+        price = extract_ml_price(item)
         if price is None:
+            return None
+
+        if not validate_price(price, self._currency, self.marketplace_id, title):
             return None
 
         link_el = item.select_one("a[href*='mercadolibre']")
@@ -144,14 +155,3 @@ class MercadoLibreScraper:
         if any(w in lower for w in ("usado", "used", "pre-owned", "segunda mano")):
             return "used"
         return "new"
-
-    @staticmethod
-    def _parse_price(text: str) -> float | None:
-        """Parsea precios como '405.188' o '5,299' (separadores de miles)."""
-        cleaned = re.sub(r"[^\d]", "", text)
-        if not cleaned:
-            return None
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None

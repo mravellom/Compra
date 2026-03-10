@@ -32,6 +32,19 @@ class MasterProduct(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # Discovery & trending
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    listing_count: Mapped[int] = mapped_column(Integer, default=0)
+    marketplace_count: Mapped[int] = mapped_column(Integer, default=0)
+    seller_count: Mapped[int] = mapped_column(Integer, default=0)
+    avg_price: Mapped[float | None] = mapped_column(Numeric(12, 2), default=0)
+    trend_score: Mapped[float] = mapped_column(REAL, default=0)
+    trend_label: Mapped[str] = mapped_column(Text, default="new")
+    velocity_7d: Mapped[float] = mapped_column(REAL, default=0)
+    velocity_30d: Mapped[float] = mapped_column(REAL, default=0)
+    is_trending: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_snapshot_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     listings: Mapped[list["ProductListing"]] = relationship(back_populates="master_product")
     opportunities: Mapped[list["Opportunity"]] = relationship(back_populates="master_product")
 
@@ -132,6 +145,10 @@ class Opportunity(Base):
     capital_efficiency_score: Mapped[float] = mapped_column(REAL, default=0)
     capital_tier: Mapped[str] = mapped_column(Text, default="medium")
     recommended_quantity: Mapped[int] = mapped_column(Integer, default=1)
+
+    # Scoring system v2
+    risk_score: Mapped[float] = mapped_column(REAL, default=50)
+    confidence_score: Mapped[float] = mapped_column(REAL, default=50)
 
     master_product: Mapped["MasterProduct"] = relationship(back_populates="opportunities")
     buy_listing: Mapped["ProductListing"] = relationship(foreign_keys=[buy_listing_id])

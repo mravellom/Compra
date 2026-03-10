@@ -61,6 +61,10 @@ class OpportunityOut(BaseModel):
     capital_tier: str = "medium"
     recommended_quantity: int = 1
 
+    # Scoring system v2
+    risk_score: float = 50
+    confidence_score: float = 50
+
     model_config = {"from_attributes": True}
 
 
