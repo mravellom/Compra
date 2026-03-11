@@ -96,15 +96,27 @@ def _parse_mercadolibre(text: str, currency: str = "") -> float | None:
     MX format: "5,299" → 5299 (comma = thousands separator)
     With cents: "193,70" or "193.70" → depends on locale
 
-    Rule: ML search results show integer prices. The fraction element has the
-    integer part, and cents are in a separate element. If we get a value that
-    looks like it has decimals (exactly 2 digits after separator), handle it.
+    Uses currency to disambiguate rather than heuristics:
+    - ARS: dot is always thousands separator
+    - MXN: comma is always thousands separator
     """
-    # Remove any remaining non-numeric chars except dots and commas
     cleaned = re.sub(r"[^\d.,]", "", text)
     if not cleaned:
         return None
 
+    cur = currency.upper()
+
+    # AR locale: dot = thousands, comma = decimal
+    if cur == "ARS":
+        # Remove dots (thousands), replace comma with dot (decimal)
+        return _to_float(cleaned.replace(".", "").replace(",", "."))
+
+    # MX locale: comma = thousands, dot = decimal
+    if cur == "MXN":
+        # Remove commas (thousands), dot stays as decimal
+        return _to_float(cleaned.replace(",", ""))
+
+    # Unknown currency: fall back to heuristic
     return _parse_ambiguous_number(cleaned, currency)
 
 

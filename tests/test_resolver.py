@@ -28,6 +28,19 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
 
 
+class _FakeAsyncCtx:
+    """Generic async context manager that returns a value."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *args):
+        pass
+
+
 class _FakeAcquire:
     """Simula pool.acquire() — sync call que retorna async context manager."""
 
@@ -42,7 +55,13 @@ class _FakeAcquire:
 
 
 def _patch_resolver(mocker, mock_conn, embedding_seed=42):
-    """Aplica los patches comunes a get_pool y generate_embedding."""
+    """Aplica los patches comunes a get_pool, generate_embedding y FX rates."""
+    # conn.transaction() is a sync call that returns an async context manager
+    # (asyncpg pattern). Override the AsyncMock's transaction to be a plain MagicMock.
+    mock_conn.transaction = MagicMock(return_value=_FakeAsyncCtx(None))
+    # conn.fetch for _price_compatible — return empty list (no existing listings)
+    mock_conn.fetch = AsyncMock(return_value=[])
+
     # pool.acquire() es sync (no awaited), retorna async ctx manager
     pool = MagicMock()
     pool.acquire.return_value = _FakeAcquire(mock_conn)
@@ -53,6 +72,12 @@ def _patch_resolver(mocker, mock_conn, embedding_seed=42):
 
     mocker.patch("processor.resolver.get_pool", side_effect=fake_get_pool)
     mocker.patch("processor.resolver.generate_embedding", return_value=make_fake_embedding(embedding_seed))
+
+    # Patch FX rates so _price_compatible doesn't hit the network
+    async def fake_get_rates():
+        return {"USD": 1.0, "ARS": 1450.0, "MXN": 17.8, "EUR": 0.86, "GBP": 0.75, "BRL": 5.10}
+
+    mocker.patch("processor.resolver.get_rates", side_effect=fake_get_rates)
 
 
 # ─── Tests de matching ──────────────────────────────────────────────
@@ -111,11 +136,11 @@ class TestResolverMatching:
         mock_conn.fetchval.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_borderline_085_matches(self, mocker):
-        """EXACTAMENTE 0.85 → está en el threshold, DEBE matchear."""
+    async def test_borderline_088_matches(self, mocker):
+        """EXACTAMENTE 0.88 (global embedding threshold) → DEBE matchear."""
         mock_conn = AsyncMock()
         mock_conn.fetchrow.return_value = {
-            "id": 3, "canonical_name": "apple airpods pro", "similarity": 0.85,
+            "id": 3, "canonical_name": "apple airpods pro", "similarity": 0.88,
         }
         _patch_resolver(mocker, mock_conn, 7)
 
@@ -124,15 +149,15 @@ class TestResolverMatching:
 
         assert result.is_new is False
         assert result.master_product_id == 3
-        assert result.similarity == 0.85
+        assert result.similarity == 0.88
         mock_conn.fetchval.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_borderline_084_creates_new(self, mocker):
-        """0.84 → justo por debajo del threshold, DEBE crear nuevo."""
+    async def test_borderline_087_creates_new(self, mocker):
+        """0.87 → just below global threshold (0.88), DEBE crear nuevo."""
         mock_conn = AsyncMock()
         mock_conn.fetchrow.return_value = {
-            "id": 3, "canonical_name": "apple airpods pro", "similarity": 0.84,
+            "id": 3, "canonical_name": "apple airpods pro", "similarity": 0.87,
         }
         mock_conn.fetchval.return_value = 20
         _patch_resolver(mocker, mock_conn, 8)
@@ -166,6 +191,35 @@ class TestResolverMatching:
         assert "sony" in canonical_name
         assert brand == "sony"
         assert model == "wh1000xm4"
+
+
+# ─── Tests de stable hash ──────────────────────────────────────────
+
+class TestStableHash:
+    """Verify the advisory lock hash is deterministic across calls."""
+
+    def test_sha256_hash_is_deterministic(self):
+        """Same input must always produce the same hash value."""
+        import hashlib
+        text = "sony wh1000xm4 audifonos bluetooth"
+        h1 = int(hashlib.sha256(text.encode()).hexdigest()[:15], 16) % (2**31 - 1)
+        h2 = int(hashlib.sha256(text.encode()).hexdigest()[:15], 16) % (2**31 - 1)
+        assert h1 == h2
+
+    def test_different_inputs_produce_different_hashes(self):
+        import hashlib
+        t1 = "sony wh1000xm4"
+        t2 = "apple airpods pro"
+        h1 = int(hashlib.sha256(t1.encode()).hexdigest()[:15], 16) % (2**31 - 1)
+        h2 = int(hashlib.sha256(t2.encode()).hexdigest()[:15], 16) % (2**31 - 1)
+        assert h1 != h2
+
+    def test_hash_fits_in_pg_int4(self):
+        """Advisory lock requires a 32-bit signed int."""
+        import hashlib
+        text = "test product title with unicode café"
+        h = int(hashlib.sha256(text.encode()).hexdigest()[:15], 16) % (2**31 - 1)
+        assert 0 <= h < 2**31
 
 
 # ─── Tests de cosine similarity (validación matemática) ─────────────

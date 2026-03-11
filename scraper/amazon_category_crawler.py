@@ -9,6 +9,7 @@ import re
 from bs4 import BeautifulSoup
 
 from .category_config import get_category_url
+from .price_parser import extract_amazon_price, validate_price
 from .rate_limiter import RateLimiter
 from .schemas import RawListing
 from .stealth import StealthSession, ProxyPool
@@ -112,12 +113,12 @@ class AmazonCategoryCrawler:
         if not title:
             return None
 
-        price_el = item.select_one(".a-price .a-offscreen")
-        if not price_el:
-            return None
-        price_text = price_el.get_text(strip=True)
-        price = self._parse_price(price_text)
+        # Use robust extractor with split-element fallback
+        price = extract_amazon_price(item)
         if price is None:
+            return None
+
+        if not validate_price(price, "MXN", self.marketplace_id, title):
             return None
 
         asin = item.get("data-asin", "")
@@ -168,12 +169,3 @@ class AmazonCategoryCrawler:
             return "used"
         return "new"
 
-    @staticmethod
-    def _parse_price(text: str) -> float | None:
-        cleaned = re.sub(r"[^\d.]", "", text)
-        if not cleaned:
-            return None
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None

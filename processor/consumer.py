@@ -11,9 +11,66 @@ from datetime import datetime, timezone
 
 import redis.asyncio as redis
 
-from .db import close_pool
+from scraper.price_parser import validate_price
+
+from api.currency import get_rates, to_usd
+
+from .db import close_pool, get_pool
 from .normalizer import normalize_title
+from .price_anomaly import detect_price_anomaly
 from .resolver import resolve_product, save_listing
+
+
+# ── USD-normalized price validation ─────────────────────────
+_MIN_PRICE_USD = 1.0
+_MAX_PRICE_USD = 20_000.0
+_MEDIAN_DEVIATION_MAX = 0.80  # reject if >80% away from product median
+
+
+async def validate_price_usd(
+    price: float,
+    currency: str,
+    master_product_id: int,
+) -> bool:
+    """Reject listings whose USD price is absurd or deviates >80% from product median.
+
+    Returns True if the price is acceptable.
+    """
+    rates = await get_rates()
+    price_usd = to_usd(price, currency, rates)
+
+    if price_usd < _MIN_PRICE_USD or price_usd > _MAX_PRICE_USD:
+        logger.warning(
+            "USD price out of bounds: %.2f %s (= $%.2f USD, bounds $%.0f–$%.0f)",
+            price, currency, price_usd, _MIN_PRICE_USD, _MAX_PRICE_USD,
+        )
+        return False
+
+    # Compare against existing listings for the same master product
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT price::float, currency FROM product_listings WHERE master_product_id = $1",
+            master_product_id,
+        )
+    if len(rows) < 3:
+        return True  # not enough data to judge
+
+    existing_usd = [to_usd(r["price"], r["currency"], rates) for r in rows]
+    import statistics
+    median_usd = statistics.median(existing_usd)
+    if median_usd <= 0:
+        return True
+
+    deviation = abs(price_usd - median_usd) / median_usd
+    if deviation > _MEDIAN_DEVIATION_MAX:
+        logger.warning(
+            "USD price deviates %.0f%% from product median: $%.2f vs median $%.2f (master=%d)",
+            deviation * 100, price_usd, median_usd, master_product_id,
+        )
+        return False
+
+    return True
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,9 +80,11 @@ logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAM_KEY = "raw_listings_queue"
+DEAD_LETTER_KEY = "dead_letter_queue"
 GROUP_NAME = "processor_group"
 CONSUMER_NAME = os.getenv("CONSUMER_NAME", "processor-1")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 
 async def ensure_consumer_group(r: redis.Redis) -> None:
@@ -47,13 +106,39 @@ async def process_message(msg_id: str, data: dict) -> None:
     marketplace_id = data.get("marketplace_id", "")
     image_url = data.get("image_url") or None
     scraped_at_str = data.get("scraped_at")
-    scraped_at = datetime.fromisoformat(scraped_at_str) if scraped_at_str else datetime.now(timezone.utc)
+    if scraped_at_str:
+        scraped_at = datetime.fromisoformat(scraped_at_str)
+        # Ensure timezone-aware (assume UTC if naive)
+        if scraped_at.tzinfo is None:
+            scraped_at = scraped_at.replace(tzinfo=timezone.utc)
+    else:
+        scraped_at = datetime.now(timezone.utc)
 
     if not title or not url:
         logger.warning("Skipping message %s: missing title or url", msg_id)
         return
 
     price = float(price_str)
+
+    if not validate_price(price, currency, marketplace_id, title):
+        logger.warning(
+            "Price validation failed: %.2f %s for '%s'",
+            price, currency, title[:50],
+        )
+        return
+
+    # Price anomaly detection: compare against historical prices for this URL
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT price::float FROM price_history WHERE listing_url = $1 ORDER BY recorded_at DESC LIMIT 20",
+            url,
+        )
+    historical_prices = [row["price"] for row in rows]
+    if detect_price_anomaly(price, historical_prices, currency=currency):
+        logger.warning("Skipping message %s: anomalous price %.2f %s for %s", msg_id, price, currency, url)
+        return
+
     normalized = normalize_title(title)
 
     # Extract enhanced metadata
@@ -69,8 +154,16 @@ async def process_message(msg_id: str, data: dict) -> None:
     shipping_str = data.get("shipping_price", "")
     shipping_price = float(shipping_str) if shipping_str else None
 
-    # Resolver producto (match o crear nuevo)
-    match = await resolve_product(title)
+    # Resolver producto (match o crear nuevo, with price signal)
+    match = await resolve_product(title, price=price, currency=currency)
+
+    # USD-normalized price validation against product cluster
+    if not match.is_new and not await validate_price_usd(price, currency, match.master_product_id):
+        logger.warning(
+            "Skipping message %s: USD price validation failed for master_product %d",
+            msg_id, match.master_product_id,
+        )
+        return
 
     # Guardar listing vinculado
     listing_id = await save_listing(
@@ -126,6 +219,28 @@ async def main() -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     logger.info("Consumer '%s' listening on stream '%s'...", CONSUMER_NAME, STREAM_KEY)
+
+    # Move messages that exceeded MAX_RETRIES to dead letter queue
+    try:
+        pending_info = await redis_client.xpending_range(
+            STREAM_KEY, GROUP_NAME, "-", "+", 100, CONSUMER_NAME,
+        )
+        dlq_count = 0
+        for entry in pending_info:
+            if entry.get("times_delivered", 0) > MAX_RETRIES:
+                msg_id = entry["message_id"]
+                logger.error("Message %s exceeded %d retries, moving to DLQ", msg_id, MAX_RETRIES)
+                await redis_client.xadd(DEAD_LETTER_KEY, {
+                    "original_id": msg_id,
+                    "consumer": CONSUMER_NAME,
+                    "retries": str(entry.get("times_delivered", 0)),
+                })
+                await redis_client.xack(STREAM_KEY, GROUP_NAME, msg_id)
+                dlq_count += 1
+        if dlq_count:
+            logger.warning("Moved %d messages to dead letter queue", dlq_count)
+    except Exception:
+        logger.error("Error checking pending retries", exc_info=True)
 
     # Procesar mensajes pending antes de leer nuevos
     try:

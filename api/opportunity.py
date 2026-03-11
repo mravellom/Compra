@@ -29,17 +29,19 @@ Algorithm:
 4. Upsert: update existing active opps, create new ones, expire stale
 5. Score 0-100 composite, rank by score
 """
+import asyncio
 import logging
 import math
 import os
 import statistics
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .currency import get_rates, to_usd
+from .database import async_session
 from .models import MasterProduct, Opportunity, PriceHistory, ProductListing
 from .scoring import ScoringInput, score as score_opportunity_v2
 
@@ -58,6 +60,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "amazon": {
         "commission": 0.15,
         "payment_processing": 0.0,
+        "vat_rate": 0.16,  # Mexico IVA 16%
         "domestic_shipping": 0.0,
         "currency": "MXN",
         "country": "MX",
@@ -65,6 +68,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "mercadolibre_mx": {
         "commission": 0.16,
         "payment_processing": 0.036,
+        "vat_rate": 0.16,  # Mexico IVA 16%
         "domestic_shipping": 0.0,
         "currency": "MXN",
         "country": "MX",
@@ -72,6 +76,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "mercadolibre_ar": {
         "commission": 0.13,
         "payment_processing": 0.036,
+        "vat_rate": 0.21,  # Argentina IVA 21%
         "domestic_shipping": 0.0,
         "currency": "ARS",
         "country": "AR",
@@ -79,16 +84,32 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "ebay": {
         "commission": 0.1312,
         "payment_processing": 0.0,
+        "vat_rate": 0.0,  # US: no VAT (sales tax handled separately by marketplace)
         "domestic_shipping": 8.0,
         "currency": "USD",
         "country": "US",
     },
 }
 
-CROSS_BORDER = {
-    "import_tax_rate": 0.16,
-    "international_shipping_usd": 25.0,
+# Directional cross-border fees: (buy_country, sell_country) -> fees
+CROSS_BORDER_FEES: dict[tuple[str, str], dict] = {
+    ("MX", "AR"): {"import_tax_rate": 0.50, "international_shipping_usd": 55.0},
+    ("AR", "MX"): {"import_tax_rate": 0.16, "international_shipping_usd": 45.0},
+    ("MX", "US"): {"import_tax_rate": 0.0, "international_shipping_usd": 15.0},
+    ("US", "MX"): {"import_tax_rate": 0.16, "international_shipping_usd": 20.0},
+    ("AR", "US"): {"import_tax_rate": 0.0, "international_shipping_usd": 50.0},
+    ("US", "AR"): {"import_tax_rate": 0.50, "international_shipping_usd": 50.0},
 }
+
+# Conservative default for unknown routes
+_DEFAULT_CROSS_BORDER = {"import_tax_rate": 0.20, "international_shipping_usd": 40.0}
+
+
+def _get_cross_border_fees(buy_mp: str, sell_mp: str) -> dict:
+    """Get directional cross-border fees based on buy/sell countries."""
+    buy_country = MARKETPLACE_FEES.get(buy_mp, {}).get("country", "?")
+    sell_country = MARKETPLACE_FEES.get(sell_mp, {}).get("country", "?")
+    return CROSS_BORDER_FEES.get((buy_country, sell_country), _DEFAULT_CROSS_BORDER)
 
 
 # ── Data structures ───────────────────────────────────────
@@ -98,6 +119,7 @@ class ProfitCalc:
     sell_price_usd: float
     marketplace_fee: float
     payment_fee: float
+    sell_tax: float
     import_tax: float
     domestic_shipping: float
     international_shipping: float
@@ -136,16 +158,24 @@ def calculate_profit(
     sell_fees = MARKETPLACE_FEES.get(sell_mp, MARKETPLACE_FEES["ebay"])
 
     marketplace_fee = sell_usd * sell_fees["commission"]
-    payment_fee = sell_usd * sell_fees.get("payment_processing", 0) + 0.30
+    payment_processing_rate = sell_fees.get("payment_processing", 0)
+    payment_fee = sell_usd * payment_processing_rate
+    if payment_processing_rate > 0:
+        payment_fee += 0.30  # Fixed fee only for marketplaces with separate payment processing
+    sell_tax = sell_usd * sell_fees.get("vat_rate", 0.0)
     domestic_shipping = 0.0 if sell_free_ship else sell_fees.get("domestic_shipping", 5.0)
 
     international_shipping = 0.0
     import_tax = 0.0
     if is_cross_border(buy_mp, sell_mp):
-        international_shipping = CROSS_BORDER["international_shipping_usd"]
-        import_tax = buy_usd * CROSS_BORDER["import_tax_rate"]
+        cb_fees = _get_cross_border_fees(buy_mp, sell_mp)
+        international_shipping = cb_fees["international_shipping_usd"]
+        # CIF = Cost + Insurance (2% of goods value) + Freight
+        insurance = buy_usd * 0.02
+        cif_value = buy_usd + insurance + international_shipping
+        import_tax = cif_value * cb_fees["import_tax_rate"]
 
-    total_fees = marketplace_fee + payment_fee + import_tax + domestic_shipping + international_shipping
+    total_fees = marketplace_fee + payment_fee + sell_tax + import_tax + domestic_shipping + international_shipping
     net_profit = sell_usd - buy_usd - total_fees
     roi = net_profit / buy_usd if buy_usd > 0 else 0.0
     margin = net_profit / sell_usd if sell_usd > 0 else 0.0
@@ -155,6 +185,7 @@ def calculate_profit(
         sell_price_usd=round(sell_usd, 2),
         marketplace_fee=round(marketplace_fee, 2),
         payment_fee=round(payment_fee, 2),
+        sell_tax=round(sell_tax, 2),
         import_tax=round(import_tax, 2),
         domestic_shipping=round(domestic_shipping, 2),
         international_shipping=round(international_shipping, 2),
@@ -167,13 +198,12 @@ def calculate_profit(
 
 # ── Filtering ─────────────────────────────────────────────
 def is_outlier_price(price: float, prices: list[float]) -> bool:
-    """IQR-based outlier detection."""
+    """IQR-based outlier detection using proper quartile calculation."""
     if len(prices) < 4:
         return False
-    s = sorted(prices)
-    q1, q3 = s[len(s) // 4], s[3 * len(s) // 4]
+    q1, _, q3 = statistics.quantiles(prices, n=4)
     iqr = q3 - q1
-    return price < (q1 - 2.0 * iqr) or price > (q3 + 2.0 * iqr)
+    return price < (q1 - 1.5 * iqr) or price > (q3 + 1.5 * iqr)
 
 
 def is_trustworthy(listing: ProductListing) -> bool:
@@ -228,7 +258,11 @@ def _extract_model_numbers(title: str) -> set[str]:
 
 
 def variants_compatible(buy: ProductListing, sell: ProductListing) -> bool:
-    """Prevent storage/bundle/accessory/model mismatches."""
+    """Prevent storage/bundle/accessory/model/condition mismatches."""
+    # Hard rule: conditions must match exactly (new ≠ used ≠ refurbished)
+    if buy.condition != sell.condition:
+        return False
+
     b, s = buy.title.lower(), sell.title.lower()
 
     # Accessory vs main product mismatch
@@ -430,19 +464,25 @@ async def detect_opportunities(db: AsyncSession) -> list[Opportunity]:
     """
     rates = await get_rates()
 
-    # Step 1: Only expire truly stale opportunities
+    # Step 1: Expire opportunities whose buy/sell listings are no longer fresh
     await db.execute(text(f"""
-        UPDATE opportunities
+        UPDATE opportunities o
         SET status = 'expired', expired_at = NOW()
-        WHERE status = 'active'
-          AND created_at < NOW() - INTERVAL '{STALE_HOURS} hours'
+        WHERE o.status = 'active'
+          AND NOT EXISTS (
+            SELECT 1 FROM product_listings pl
+            WHERE pl.id IN (o.buy_listing_id, o.sell_listing_id)
+              AND pl.scraped_at > NOW() - INTERVAL '{STALE_HOURS} hours'
+          )
     """))
     await db.flush()
 
-    # Step 2: Find products with listings in 2+ marketplaces (SQL-first)
+    # Step 2: Find products with FRESH listings in 2+ marketplaces (SQL-first)
+    # Only consider listings scraped in the last 24h to avoid ghost opportunities
     result = await db.execute(text("""
         SELECT pl.master_product_id, COUNT(DISTINCT pl.marketplace_id) AS mp_count
         FROM product_listings pl
+        WHERE pl.scraped_at > NOW() - INTERVAL '24 hours'
         GROUP BY pl.master_product_id
         HAVING COUNT(DISTINCT pl.marketplace_id) >= 2
         ORDER BY COUNT(DISTINCT pl.id) DESC
@@ -458,13 +498,31 @@ async def detect_opportunities(db: AsyncSession) -> list[Opportunity]:
 
     new_opps: list[Opportunity] = []
 
-    for mp_id, _ in candidates:
-        opp = await _analyze_product(db, mp_id, rates)
-        if opp:
-            new_opps.append(opp)
+    # Process candidates in parallel batches.
+    # Each coroutine gets its own AsyncSession to avoid corrupting shared
+    # SQLAlchemy session state when multiple coroutines run concurrently.
+    async def _analyze_with_own_session(product_id: int) -> Opportunity | None:
+        async with async_session() as session:
+            return await _analyze_product(session, product_id, rates)
+
+    ANALYSIS_BATCH_SIZE = 20
+    for i in range(0, len(candidates), ANALYSIS_BATCH_SIZE):
+        batch = candidates[i:i + ANALYSIS_BATCH_SIZE]
+        results = await asyncio.gather(
+            *[_analyze_with_own_session(mp_id) for mp_id, _ in batch],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Opportunity):
+                new_opps.append(r)
+            elif isinstance(r, Exception):
+                logger.error("Error analyzing product: %s", r)
+
+    # Each _analyze_with_own_session commits independently, so we only
+    # need to commit the expire/flush done on the caller's session.
+    await db.commit()
 
     if new_opps:
-        await db.commit()
         new_opps.sort(key=lambda o: o.opportunity_score, reverse=True)
 
         high = sum(1 for o in new_opps if o.confidence_level == "high")
@@ -473,7 +531,6 @@ async def detect_opportunities(db: AsyncSession) -> list[Opportunity]:
         logger.info("Detected %d opportunities (high=%d, med=%d, low=%d)",
                      len(new_opps), high, med, low)
     else:
-        await db.commit()
         logger.info("No qualifying opportunities found")
 
     return new_opps
@@ -483,10 +540,14 @@ async def _analyze_product(
     db: AsyncSession, product_id: int, rates: dict[str, float]
 ) -> Opportunity | None:
     """Analyze a single product cluster for arbitrage. Returns best opportunity or None."""
-    # Load listings
+    # Load only fresh listings (scraped in last 24h)
+    freshness_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     result = await db.execute(
         select(ProductListing)
-        .where(ProductListing.master_product_id == product_id)
+        .where(
+            ProductListing.master_product_id == product_id,
+            ProductListing.scraped_at > freshness_cutoff,
+        )
         .order_by(ProductListing.price)
     )
     all_listings = list(result.scalars().all())
@@ -526,10 +587,6 @@ async def _analyze_product(
             buy_listings = by_mp[buy_mp]
             sell_listings = by_mp[sell_mp]
 
-            comp = analyze_competition(sell_listings, rates)
-            if comp.realistic_sell_usd <= 0:
-                continue
-
             # Cheapest buy
             buy_candidate = min(buy_listings, key=lambda l: to_usd(float(l.price), l.currency, rates))
             buy_usd = to_usd(float(buy_candidate.price), buy_candidate.currency, rates)
@@ -541,6 +598,13 @@ async def _analyze_product(
                 and variants_compatible(buy_candidate, s)
             ]
             if not compatible:
+                continue
+
+            # Analyze competition ONLY among compatible listings.
+            # Using unfiltered sell_listings inflates the realistic sell price
+            # when the cluster contains mixed variants (e.g. 128GB + 256GB).
+            comp = analyze_competition(compatible, rates)
+            if comp.realistic_sell_usd <= 0:
                 continue
 
             sell_candidate = max(compatible, key=lambda l: to_usd(float(l.price), l.currency, rates))
@@ -686,6 +750,7 @@ async def _analyze_product(
                 "recommended_quantity",
             ):
                 setattr(old, attr, getattr(best_opp, attr))
+            await db.commit()
             logger.info(
                 "UPDATED opp id=%d | %s->%s | profit $%.2f | margin %.0f%% | score %.0f",
                 old.id, old.buy_marketplace, old.sell_marketplace,
@@ -694,6 +759,7 @@ async def _analyze_product(
             return old
         else:
             db.add(best_opp)
+            await db.commit()
             logger.info(
                 "NEW opp | %s->%s | profit $%.2f | margin %.0f%% | score %.0f",
                 best_opp.buy_marketplace, best_opp.sell_marketplace,

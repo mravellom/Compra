@@ -1,143 +1,187 @@
 """
 Validation Tests — Opportunity Engine (Price Calculations)
 
-Fórmulas verificadas:
-  fees        = sell_price * 0.13
-  net_profit  = sell_price - buy_price - fees - shipping
-  roi         = net_profit / buy_price          (decimal: 0.64)
-  roi_percent = (net_profit / buy_price) * 100  (display: 64.0%)
-
-Tabla de verdad: 6 escenarios base + edge cases.
+Tests the production calculate_profit() with marketplace-specific fees.
+Also tests IQR outlier detection and cross-border fee logic.
 """
 import pytest
 
-from api.opportunity import ProfitCalc, calculate_profit
+from api.opportunity import (
+    ProfitCalc,
+    calculate_profit,
+    is_cross_border,
+    is_outlier_price,
+    variants_compatible,
+    MARKETPLACE_FEES,
+)
 
 
 class TestCalculateProfit:
-    """Tabla de verdad exhaustiva con cálculo manual verificable."""
+    """Tests for production calculate_profit with marketplace fees."""
 
-    # ═══════════════════════════════════════════════════════════════
-    # Tabla de verdad (fee_rate=13%, shipping=$10)
-    #
-    # Escenario               | Buy    | Sell   | Fees    | Ship | Net Profit | ROI (dec) | ROI (%)
-    # ─────────────────────── | ────── | ────── | ─────── | ──── | ────────── | ───────── | ───────
-    # 1. Rentable clásico     | $100   | $200   | $26.00  | $10  | $64.00     | 0.6400    | 64.0%
-    # 2. Ejemplo arquitectura | $120   | $200   | $26.00  | $10  | $44.00     | 0.3667    | 36.7%
-    # 3. Producto barato      | $50    | $100   | $13.00  | $10  | $27.00     | 0.5400    | 54.0%
-    # 4. Margen estrecho      | $200   | $250   | $32.50  | $10  | $7.50      | 0.0375    | 3.8%
-    # 5. Mismo precio (pierde)| $100   | $100   | $13.00  | $10  | -$23.00    | -0.2300   | -23.0%
-    # 6. Alto volumen         | $500   | $1000  | $130.00 | $10  | $360.00    | 0.7200    | 72.0%
-    # ═══════════════════════════════════════════════════════════════
+    def test_domestic_amazon_to_ml_mx(self):
+        """Same country (MX): no cross-border fees, but VAT applies."""
+        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx")
+        assert not is_cross_border("amazon", "mercadolibre_mx")
+        # ML MX: 16% commission + 3.6% payment + $0.30 fixed + 16% IVA
+        assert result.marketplace_fee == pytest.approx(32.0, abs=0.01)
+        assert result.payment_fee == pytest.approx(7.50, abs=0.01)  # 200*0.036 + 0.30
+        assert result.sell_tax == pytest.approx(32.0, abs=0.01)  # 200*0.16 IVA
+        assert result.import_tax == 0.0
+        assert result.international_shipping == 0.0
 
-    @pytest.mark.parametrize(
-        "buy, sell, exp_fees, exp_profit, exp_roi_decimal, exp_roi_percent",
-        [
-            (100.0,  200.0,   26.00,   64.00,  0.6400,   64.0),
-            (120.0,  200.0,   26.00,   44.00,  0.3667,   36.7),
-            ( 50.0,  100.0,   13.00,   27.00,  0.5400,   54.0),
-            (200.0,  250.0,   32.50,    7.50,  0.0375,    3.8),
-            (100.0,  100.0,   13.00,  -23.00, -0.2300,  -23.0),
-            (500.0, 1000.0,  130.00,  360.00,  0.7200,   72.0),
-        ],
-        ids=[
-            "1-profitable-classic",
-            "2-architecture-example",
-            "3-cheap-product",
-            "4-narrow-margin",
-            "5-same-price-loss",
-            "6-high-volume",
-        ],
-    )
-    def test_truth_table(self, buy, sell, exp_fees, exp_profit, exp_roi_decimal, exp_roi_percent):
-        result = calculate_profit(buy, sell)
+    def test_cross_border_mx_to_ar(self):
+        """MX -> AR: 50% import tax on CIF (buy + insurance + shipping) + $55 shipping."""
+        result = calculate_profit(100.0, 300.0, "amazon", "mercadolibre_ar")
+        assert is_cross_border("amazon", "mercadolibre_ar")
+        # CIF = 100 + 2.0 (2% insurance) + 55 = 157, import_tax = 157 * 0.50 = 78.50
+        assert result.import_tax == pytest.approx(78.50, abs=0.01)
+        assert result.international_shipping == 55.0
 
-        # Inputs preservados
-        assert result.buy_price == buy
-        assert result.sell_price == sell
-        assert result.shipping_cost == 10.0
+    def test_cross_border_ar_to_mx(self):
+        """AR -> MX: 16% import tax on CIF (buy + insurance + shipping) + $45 shipping."""
+        result = calculate_profit(100.0, 300.0, "mercadolibre_ar", "mercadolibre_mx")
+        # CIF = 100 + 2.0 (2% insurance) + 45 = 147, import_tax = 147 * 0.16 = 23.52
+        assert result.import_tax == pytest.approx(23.52, abs=0.01)
+        assert result.international_shipping == 45.0
 
-        # Fees = sell_price * 0.13
-        assert result.fees == pytest.approx(exp_fees, abs=0.01)
+    def test_payment_fee_only_when_payment_processing(self):
+        """Amazon has 0% payment_processing, should NOT add $0.30 fixed fee."""
+        result = calculate_profit(100.0, 200.0, "mercadolibre_mx", "amazon")
+        # Amazon: 15% commission, 0% payment, no $0.30
+        assert result.payment_fee == 0.0
 
-        # Net profit = sell - buy - fees - shipping
-        assert result.net_profit == pytest.approx(exp_profit, abs=0.01)
-
-        # ROI decimal = net_profit / buy_price
-        assert result.roi == pytest.approx(exp_roi_decimal, abs=0.001)
-
-        # ROI porcentual = (net_profit / buy_price) * 100
-        roi_as_percent = result.roi * 100
-        assert roi_as_percent == pytest.approx(exp_roi_percent, abs=0.1)
-
-    # ─── Edge case: buy_price = 0 (división por cero) ───────────
+    def test_payment_fee_with_ml(self):
+        """ML has 3.6% payment_processing + $0.30 fixed fee."""
+        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx")
+        # 200 * 0.036 + 0.30 = 7.50
+        assert result.payment_fee == pytest.approx(7.50, abs=0.01)
 
     def test_zero_buy_price_no_division_error(self):
-        """buy_price=0 → ROI debe ser 0.0, sin ZeroDivisionError."""
-        result = calculate_profit(0.0, 100.0)
-        assert result.roi == 0.0  # protección contra div/0
-        assert result.fees == pytest.approx(13.0, abs=0.01)
-        assert result.net_profit == pytest.approx(77.0, abs=0.01)  # 100 - 0 - 13 - 10
-
-    # ─── ROI formula verification ───────────────────────────────
+        """buy_price=0 → ROI must be 0.0, no ZeroDivisionError."""
+        result = calculate_profit(0.0, 100.0, "amazon", "mercadolibre_mx")
+        assert result.roi == 0.0
 
     def test_roi_is_net_profit_over_buy_price(self):
-        """Verifica explícitamente: ROI = net_profit / buy_price."""
-        result = calculate_profit(100.0, 200.0)
-        expected_roi = result.net_profit / result.buy_price
+        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx")
+        expected_roi = result.net_profit / result.buy_price_usd
         assert result.roi == pytest.approx(expected_roi, abs=0.0001)
 
-    def test_roi_percent_conversion(self):
-        """ROI decimal 0.64 multiplicado por 100 = 64.0%."""
-        result = calculate_profit(100.0, 200.0)
-        assert (result.roi * 100) == pytest.approx(64.0, abs=0.1)
-
-    # ─── Custom parameters ──────────────────────────────────────
-
-    def test_custom_fee_rate_10_percent(self):
-        result = calculate_profit(100.0, 200.0, fee_rate=0.10)
-        assert result.fees == pytest.approx(20.0, abs=0.01)
-        assert result.net_profit == pytest.approx(70.0, abs=0.01)  # 200-100-20-10
-
-    def test_custom_shipping_25(self):
-        result = calculate_profit(100.0, 200.0, shipping_cost=25.0)
-        assert result.shipping_cost == 25.0
-        assert result.net_profit == pytest.approx(49.0, abs=0.01)  # 200-100-26-25
-
-    def test_zero_fees_and_shipping(self):
-        result = calculate_profit(100.0, 200.0, fee_rate=0.0, shipping_cost=0.0)
-        assert result.fees == 0.0
-        assert result.shipping_cost == 0.0
-        assert result.net_profit == pytest.approx(100.0, abs=0.01)
-        assert result.roi == pytest.approx(1.0, abs=0.001)
-
-    def test_return_type_is_profit_calc(self):
-        assert isinstance(calculate_profit(100.0, 200.0), ProfitCalc)
-
-
-class TestProfitEdgeCases:
-
-    def test_very_large_numbers(self):
-        result = calculate_profit(50_000.0, 100_000.0)
-        assert result.fees == pytest.approx(13_000.0, abs=0.01)
-        assert result.net_profit == pytest.approx(36_990.0, abs=0.01)
-        assert result.roi > 0
-
-    def test_penny_prices(self):
-        result = calculate_profit(0.01, 0.02)
-        assert isinstance(result.net_profit, float)
-        assert isinstance(result.roi, float)
+    def test_margin_is_net_profit_over_sell_price(self):
+        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx")
+        expected_margin = result.net_profit / result.sell_price_usd
+        assert result.margin == pytest.approx(expected_margin, abs=0.0001)
 
     def test_sell_below_buy_negative_roi(self):
-        result = calculate_profit(100.0, 50.0)
+        result = calculate_profit(200.0, 100.0, "amazon", "mercadolibre_mx")
         assert result.net_profit < 0
         assert result.roi < 0
-        # ROI negativo en porcentaje
-        assert (result.roi * 100) < 0
 
-    def test_slight_loss_with_fees(self):
-        """$120 sell - $100 buy - $15.60 fees - $10 ship = -$5.60."""
-        result = calculate_profit(100.0, 120.0)
-        assert result.fees == pytest.approx(15.60, abs=0.01)
-        assert result.net_profit == pytest.approx(-5.60, abs=0.01)
-        assert result.roi == pytest.approx(-0.056, abs=0.001)
+    def test_return_type_is_profit_calc(self):
+        assert isinstance(calculate_profit(100.0, 200.0, "amazon", "ebay"), ProfitCalc)
+
+    def test_free_shipping_overrides_domestic(self):
+        """sell_free_ship=True should zero out domestic shipping."""
+        # ebay has $8 domestic shipping default
+        result_no_free = calculate_profit(100.0, 200.0, "amazon", "ebay", sell_free_ship=False)
+        result_free = calculate_profit(100.0, 200.0, "amazon", "ebay", sell_free_ship=True)
+        assert result_free.domestic_shipping == 0.0
+        assert result_no_free.domestic_shipping == 8.0
+        assert result_free.net_profit > result_no_free.net_profit
+
+
+class TestVariantsCompetitionIntegration:
+    """Verify that competition is computed on compatible listings only."""
+
+    def test_analyze_competition_basic(self):
+        """analyze_competition returns correct median-based realistic price."""
+        from unittest.mock import MagicMock
+        from api.opportunity import analyze_competition
+
+        rates = {"USD": 1.0, "MXN": 17.0}
+
+        # Two listings at $100 and $200
+        l1 = MagicMock(price=100.0, currency="USD")
+        l2 = MagicMock(price=200.0, currency="USD")
+        comp = analyze_competition([l1, l2], rates)
+        # median([100, 200]) = 150, realistic = 150 * 0.97 = 145.5
+        assert comp.realistic_sell_usd == pytest.approx(145.5, abs=0.01)
+
+    def test_compatible_filter_excludes_mismatched_variants(self):
+        """Incompatible storage variants should be excluded."""
+        from unittest.mock import MagicMock
+
+        buy = MagicMock(title="iPhone 15 128gb Negro", condition="new")
+        sell_128 = MagicMock(title="iPhone 15 128gb Azul", condition="new")
+        sell_256 = MagicMock(title="iPhone 15 256gb Negro", condition="new")
+
+        assert variants_compatible(buy, sell_128) is True
+        assert variants_compatible(buy, sell_256) is False
+
+    def test_condition_mismatch_blocks_arbitrage(self):
+        """Used/refurbished vs new must be rejected — prevents phantom profits."""
+        from unittest.mock import MagicMock
+
+        buy_used = MagicMock(title="iPhone 15 128gb", condition="used")
+        sell_new = MagicMock(title="iPhone 15 128gb", condition="new")
+        sell_refurb = MagicMock(title="iPhone 15 128gb", condition="refurbished")
+        sell_used = MagicMock(title="iPhone 15 128gb", condition="used")
+
+        assert variants_compatible(buy_used, sell_new) is False
+        assert variants_compatible(buy_used, sell_refurb) is False
+        assert variants_compatible(buy_used, sell_used) is True
+
+    def test_vat_included_in_total_fees(self):
+        """VAT/IVA must be part of total_fees and reduce net_profit."""
+        result_mx = calculate_profit(100.0, 200.0, "mercadolibre_mx", "mercadolibre_mx")
+        # sell_tax = 200 * 0.16 = 32.0
+        assert result_mx.sell_tax == pytest.approx(32.0, abs=0.01)
+        assert result_mx.sell_tax > 0
+        # total_fees must include sell_tax
+        expected_total = (
+            result_mx.marketplace_fee + result_mx.payment_fee + result_mx.sell_tax
+            + result_mx.import_tax + result_mx.domestic_shipping + result_mx.international_shipping
+        )
+        assert result_mx.total_fees == pytest.approx(expected_total, abs=0.01)
+
+    def test_ebay_no_vat(self):
+        """eBay (US) should have zero VAT."""
+        result = calculate_profit(100.0, 200.0, "amazon", "ebay")
+        assert result.sell_tax == 0.0
+
+
+class TestOutlierDetection:
+
+    def test_too_few_prices_no_outlier(self):
+        assert is_outlier_price(1000.0, [10.0, 20.0, 30.0]) is False
+
+    def test_normal_price_not_outlier(self):
+        prices = [100.0, 105.0, 110.0, 95.0, 102.0]
+        assert is_outlier_price(108.0, prices) is False
+
+    def test_extreme_high_is_outlier(self):
+        prices = [100.0, 105.0, 110.0, 95.0, 102.0]
+        assert is_outlier_price(500.0, prices) is True
+
+    def test_extreme_low_is_outlier(self):
+        prices = [100.0, 105.0, 110.0, 95.0, 102.0]
+        assert is_outlier_price(1.0, prices) is True
+
+    def test_uses_proper_quartiles(self):
+        """Verify IQR uses statistics.quantiles with 1.5x multiplier."""
+        prices = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        # Q1=22.5, Q3=67.5, IQR=45, lower=-45.0, upper=135.0
+        assert is_outlier_price(150.0, prices) is True   # above upper bound
+        assert is_outlier_price(80.0, prices) is False    # within range
+        assert is_outlier_price(5.0, prices) is False     # within range (lower=-45)
+
+
+class TestCrossBorder:
+
+    def test_same_country_not_cross_border(self):
+        assert not is_cross_border("amazon", "mercadolibre_mx")
+
+    def test_different_country_is_cross_border(self):
+        assert is_cross_border("amazon", "mercadolibre_ar")
+        assert is_cross_border("mercadolibre_ar", "amazon")
+        assert is_cross_border("amazon", "ebay")
