@@ -146,6 +146,10 @@ class Opportunity(Base):
     capital_tier: Mapped[str] = mapped_column(Text, default="medium")
     recommended_quantity: Mapped[int] = mapped_column(Integer, default=1)
 
+    # Route info
+    route: Mapped[str] = mapped_column(Text, default="")
+    sell_tax: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+
     # Scoring system v2
     risk_score: Mapped[float] = mapped_column(REAL, default=50)
     confidence_score: Mapped[float] = mapped_column(REAL, default=50)

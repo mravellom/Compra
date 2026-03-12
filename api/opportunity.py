@@ -43,74 +43,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .currency import get_rates, to_usd
 from .database import async_session
 from .models import MasterProduct, Opportunity, PriceHistory, ProductListing
+from .routes_config import (
+    ARBITRAGE_ROUTES,
+    VALID_ROUTE_PAIRS,
+    MARKETPLACE_FEES,
+    CROSS_BORDER_FEES,
+    DEFAULT_CROSS_BORDER,
+    get_cross_border_fees,
+    get_route_label,
+    get_route_difficulty,
+    is_cross_border,
+)
 from .scoring import ScoringInput, score as score_opportunity_v2
 
 logger = logging.getLogger(__name__)
 
 # ── Configurable thresholds ───────────────────────────────
-MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "20"))
-MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.25"))       # 25%
-MIN_ROI = float(os.getenv("MIN_ROI", "0.10"))             # 10%
+MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "5"))
+MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.10"))       # 10%
+MIN_ROI = float(os.getenv("MIN_ROI", "0.05"))             # 5%
 MAX_ROI = float(os.getenv("MAX_ROI", "3.0"))              # 300% — anything above is likely bad data/scam
 MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "5.0"))  # sell/buy > 5x = mismatched products or scam listing
 STALE_HOURS = int(os.getenv("STALE_HOURS", "24"))         # expire opps older than this
-
-# ── Fee tables ────────────────────────────────────────────
-MARKETPLACE_FEES: dict[str, dict] = {
-    "amazon": {
-        "commission": 0.15,
-        "payment_processing": 0.0,
-        "vat_rate": 0.16,  # Mexico IVA 16%
-        "domestic_shipping": 0.0,
-        "currency": "MXN",
-        "country": "MX",
-    },
-    "mercadolibre_mx": {
-        "commission": 0.16,
-        "payment_processing": 0.036,
-        "vat_rate": 0.16,  # Mexico IVA 16%
-        "domestic_shipping": 0.0,
-        "currency": "MXN",
-        "country": "MX",
-    },
-    "mercadolibre_ar": {
-        "commission": 0.13,
-        "payment_processing": 0.036,
-        "vat_rate": 0.21,  # Argentina IVA 21%
-        "domestic_shipping": 0.0,
-        "currency": "ARS",
-        "country": "AR",
-    },
-    "ebay": {
-        "commission": 0.1312,
-        "payment_processing": 0.0,
-        "vat_rate": 0.0,  # US: no VAT (sales tax handled separately by marketplace)
-        "domestic_shipping": 8.0,
-        "currency": "USD",
-        "country": "US",
-    },
-}
-
-# Directional cross-border fees: (buy_country, sell_country) -> fees
-CROSS_BORDER_FEES: dict[tuple[str, str], dict] = {
-    ("MX", "AR"): {"import_tax_rate": 0.50, "international_shipping_usd": 55.0},
-    ("AR", "MX"): {"import_tax_rate": 0.16, "international_shipping_usd": 45.0},
-    ("MX", "US"): {"import_tax_rate": 0.0, "international_shipping_usd": 15.0},
-    ("US", "MX"): {"import_tax_rate": 0.16, "international_shipping_usd": 20.0},
-    ("AR", "US"): {"import_tax_rate": 0.0, "international_shipping_usd": 50.0},
-    ("US", "AR"): {"import_tax_rate": 0.50, "international_shipping_usd": 50.0},
-}
-
-# Conservative default for unknown routes
-_DEFAULT_CROSS_BORDER = {"import_tax_rate": 0.20, "international_shipping_usd": 40.0}
-
-
-def _get_cross_border_fees(buy_mp: str, sell_mp: str) -> dict:
-    """Get directional cross-border fees based on buy/sell countries."""
-    buy_country = MARKETPLACE_FEES.get(buy_mp, {}).get("country", "?")
-    sell_country = MARKETPLACE_FEES.get(sell_mp, {}).get("country", "?")
-    return CROSS_BORDER_FEES.get((buy_country, sell_country), _DEFAULT_CROSS_BORDER)
-
 
 # ── Data structures ───────────────────────────────────────
 @dataclass
@@ -140,12 +94,6 @@ class CompetitionInfo:
 
 
 # ── Core calculations ─────────────────────────────────────
-def is_cross_border(buy_mp: str, sell_mp: str) -> bool:
-    buy_country = MARKETPLACE_FEES.get(buy_mp, {}).get("country", "?")
-    sell_country = MARKETPLACE_FEES.get(sell_mp, {}).get("country", "?")
-    return buy_country != sell_country
-
-
 def calculate_profit(
     buy_usd: float,
     sell_usd: float,
@@ -168,10 +116,10 @@ def calculate_profit(
     international_shipping = 0.0
     import_tax = 0.0
     if is_cross_border(buy_mp, sell_mp):
-        cb_fees = _get_cross_border_fees(buy_mp, sell_mp)
-        international_shipping = cb_fees["international_shipping_usd"]
-        # CIF = Cost + Insurance (2% of goods value) + Freight
-        insurance = buy_usd * 0.02
+        cb_fees = get_cross_border_fees(buy_mp, sell_mp)
+        international_shipping = cb_fees["shipping_usd"]
+        # CIF = Cost + Insurance + Freight
+        insurance = buy_usd * cb_fees.get("insurance_rate", 0.02)
         cif_value = buy_usd + insurance + international_shipping
         import_tax = cif_value * cb_fees["import_tax_rate"]
 
@@ -579,9 +527,12 @@ async def _analyze_product(
     best_opp: Opportunity | None = None
     best_score = -1.0
 
-    for i, buy_mp in enumerate(mps):
+    for buy_mp in mps:
         for sell_mp in mps:
             if buy_mp == sell_mp:
+                continue
+            # Only evaluate valid arbitrage routes
+            if (buy_mp, sell_mp) not in VALID_ROUTE_PAIRS:
                 continue
 
             buy_listings = by_mp[buy_mp]
@@ -676,6 +627,7 @@ async def _analyze_product(
                 listing_age_days=listing_age,
                 is_cross_border=is_cross_border(buy_mp, sell_mp),
                 price_spread_pct=price_spread,
+                route_difficulty=get_route_difficulty(buy_mp, sell_mp),
             )
             result = score_opportunity_v2(scoring_input)
 
@@ -694,8 +646,10 @@ async def _analyze_product(
                     roi=calc.roi,
                     buy_marketplace=buy_mp,
                     sell_marketplace=sell_mp,
+                    route=get_route_label(buy_mp, sell_mp),
                     marketplace_fee=calc.marketplace_fee,
                     payment_fee=calc.payment_fee,
+                    sell_tax=calc.sell_tax,
                     import_tax=calc.import_tax,
                     domestic_shipping=calc.domestic_shipping,
                     international_shipping=calc.international_shipping,
@@ -739,7 +693,7 @@ async def _analyze_product(
             for attr in (
                 "buy_listing_id", "sell_listing_id", "buy_price", "sell_price",
                 "estimated_sell_price", "fees", "shipping_cost", "net_profit", "roi",
-                "marketplace_fee", "payment_fee", "import_tax", "domestic_shipping",
+                "route", "marketplace_fee", "payment_fee", "sell_tax", "import_tax", "domestic_shipping",
                 "international_shipping", "sales_velocity_score", "competition_score",
                 "price_stability_score", "opportunity_score", "confidence_level",
                 "risk_score", "confidence_score",

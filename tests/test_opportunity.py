@@ -9,9 +9,11 @@ import pytest
 from api.opportunity import (
     ProfitCalc,
     calculate_profit,
-    is_cross_border,
     is_outlier_price,
     variants_compatible,
+)
+from api.routes_config import (
+    is_cross_border,
     MARKETPLACE_FEES,
 )
 
@@ -31,12 +33,12 @@ class TestCalculateProfit:
         assert result.international_shipping == 0.0
 
     def test_cross_border_mx_to_ar(self):
-        """MX -> AR: 50% import tax on CIF (buy + insurance + shipping) + $55 shipping."""
+        """MX -> AR: 50% import tax on CIF (buy + insurance + shipping) + $14 shipping."""
         result = calculate_profit(100.0, 300.0, "amazon", "mercadolibre_ar")
         assert is_cross_border("amazon", "mercadolibre_ar")
-        # CIF = 100 + 2.0 (2% insurance) + 55 = 157, import_tax = 157 * 0.50 = 78.50
-        assert result.import_tax == pytest.approx(78.50, abs=0.01)
-        assert result.international_shipping == 55.0
+        # CIF = 100 + 2.0 (2% insurance) + 14 = 116, import_tax = 116 * 0.50 = 58.0
+        assert result.import_tax == pytest.approx(58.0, abs=0.01)
+        assert result.international_shipping == 14.0
 
     def test_cross_border_ar_to_mx(self):
         """AR -> MX: 16% import tax on CIF (buy + insurance + shipping) + $45 shipping."""
@@ -44,6 +46,22 @@ class TestCalculateProfit:
         # CIF = 100 + 2.0 (2% insurance) + 45 = 147, import_tax = 147 * 0.16 = 23.52
         assert result.import_tax == pytest.approx(23.52, abs=0.01)
         assert result.international_shipping == 45.0
+
+    def test_cross_border_us_to_mx(self):
+        """US -> MX: 16% import tax + $15 shipping."""
+        result = calculate_profit(100.0, 300.0, "amazon_us", "mercadolibre_mx")
+        assert is_cross_border("amazon_us", "mercadolibre_mx")
+        # CIF = 100 + 2.0 + 15 = 117, import_tax = 117 * 0.16 = 18.72
+        assert result.import_tax == pytest.approx(18.72, abs=0.01)
+        assert result.international_shipping == 15.0
+
+    def test_cross_border_cn_to_mx(self):
+        """CN -> MX: 16% import tax + $8 shipping (AliExpress)."""
+        result = calculate_profit(50.0, 200.0, "aliexpress", "mercadolibre_mx")
+        assert is_cross_border("aliexpress", "mercadolibre_mx")
+        # CIF = 50 + 1.0 + 8 = 59, import_tax = 59 * 0.16 = 9.44
+        assert result.import_tax == pytest.approx(9.44, abs=0.01)
+        assert result.international_shipping == 8.0
 
     def test_payment_fee_only_when_payment_processing(self):
         """Amazon has 0% payment_processing, should NOT add $0.30 fixed fee."""
@@ -146,7 +164,7 @@ class TestVariantsCompetitionIntegration:
 
     def test_ebay_no_vat(self):
         """eBay (US) should have zero VAT."""
-        result = calculate_profit(100.0, 200.0, "amazon", "ebay")
+        result = calculate_profit(100.0, 200.0, "amazon_us", "ebay")
         assert result.sell_tax == 0.0
 
 
@@ -184,4 +202,44 @@ class TestCrossBorder:
     def test_different_country_is_cross_border(self):
         assert is_cross_border("amazon", "mercadolibre_ar")
         assert is_cross_border("mercadolibre_ar", "amazon")
-        assert is_cross_border("amazon", "ebay")
+        assert is_cross_border("amazon_us", "mercadolibre_mx")
+
+    def test_us_marketplaces_same_country(self):
+        assert not is_cross_border("amazon_us", "ebay")
+
+    def test_cn_is_cross_border(self):
+        assert is_cross_border("aliexpress", "mercadolibre_mx")
+        assert is_cross_border("aliexpress", "amazon")
+
+    def test_cl_cross_border(self):
+        assert is_cross_border("amazon_us", "mercadolibre_cl")
+        assert is_cross_border("amazon", "mercadolibre_cl")
+
+
+class TestRouteConfig:
+
+    def test_all_marketplaces_have_required_keys(self):
+        required = {"commission", "payment_processing", "vat_rate", "domestic_shipping", "currency", "country"}
+        for mp_id, fees in MARKETPLACE_FEES.items():
+            missing = required - set(fees.keys())
+            assert not missing, f"{mp_id} missing keys: {missing}"
+
+    def test_route_labels(self):
+        from api.routes_config import get_route_label
+        assert get_route_label("amazon_us", "mercadolibre_mx") == "US→MX"
+        assert get_route_label("aliexpress", "mercadolibre_mx") == "CN→MX"
+        assert get_route_label("amazon", "mercadolibre_mx") == "MX→MX"
+
+    def test_valid_routes_exist(self):
+        from api.routes_config import VALID_ROUTE_PAIRS
+        assert ("amazon_us", "mercadolibre_mx") in VALID_ROUTE_PAIRS
+        assert ("aliexpress", "mercadolibre_mx") in VALID_ROUTE_PAIRS
+        assert ("amazon", "mercadolibre_mx") in VALID_ROUTE_PAIRS
+        # Invalid routes should not exist
+        assert ("mercadolibre_mx", "mercadolibre_mx") not in VALID_ROUTE_PAIRS
+
+    def test_route_difficulty(self):
+        from api.routes_config import get_route_difficulty
+        assert get_route_difficulty("amazon", "mercadolibre_mx") == 1  # domestic
+        assert get_route_difficulty("amazon_us", "mercadolibre_cl") == 2  # medium
+        assert get_route_difficulty("amazon_us", "mercadolibre_ar") == 3  # hard

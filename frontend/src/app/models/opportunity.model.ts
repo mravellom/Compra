@@ -52,6 +52,9 @@ export interface Opportunity {
   capital_efficiency_score: number;
   capital_tier: string;
   recommended_quantity: number;
+
+  // Route
+  route: string;
 }
 
 export interface RelatedListing {

@@ -24,6 +24,10 @@ class OpportunityOut(BaseModel):
     status: str
     created_at: datetime
 
+    # Route
+    route: str = ""
+    sell_tax: float = 0
+
     # Production scoring
     marketplace_fee: float = 0
     payment_fee: float = 0

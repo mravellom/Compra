@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Currency symbols to strip
 _CURRENCY_SYMBOLS = re.compile(
-    r"(?:US\s*)?[\$€£¥₹₽R\$]|MXN|ARS|USD|EUR|GBP|BRL",
+    r"(?:US\s*)?[\$€£¥₹₽R\$]|MXN|ARS|USD|EUR|GBP|BRL|CLP|COP|CNY|RMB",
     re.IGNORECASE,
 )
 
@@ -94,11 +94,15 @@ def _parse_mercadolibre(text: str, currency: str = "") -> float | None:
 
     AR format: "405.188" → 405188 (dot = thousands separator)
     MX format: "5,299" → 5299 (comma = thousands separator)
+    CL format: "89.990" → 89990 (dot = thousands, no decimals — CLP has no cents)
+    CO format: "299.900" → 299900 (dot = thousands, no decimals — COP has no cents)
     With cents: "193,70" or "193.70" → depends on locale
 
     Uses currency to disambiguate rather than heuristics:
     - ARS: dot is always thousands separator
     - MXN: comma is always thousands separator
+    - CLP: dot is always thousands separator (no decimal part)
+    - COP: dot is always thousands separator (no decimal part)
     """
     cleaned = re.sub(r"[^\d.,]", "", text)
     if not cleaned:
@@ -106,8 +110,8 @@ def _parse_mercadolibre(text: str, currency: str = "") -> float | None:
 
     cur = currency.upper()
 
-    # AR locale: dot = thousands, comma = decimal
-    if cur == "ARS":
+    # AR/CL/CO locale: dot = thousands, comma = decimal
+    if cur in ("ARS", "CLP", "COP"):
         # Remove dots (thousands), replace comma with dot (decimal)
         return _to_float(cleaned.replace(".", "").replace(",", "."))
 
@@ -349,6 +353,9 @@ MIN_PRICES = {
     "EUR": 0.50,
     "GBP": 0.50,
     "BRL": 2.0,
+    "CLP": 500,
+    "COP": 1000,
+    "CNY": 1.0,
 }
 
 # Maximum realistic prices by currency
@@ -359,6 +366,9 @@ MAX_PRICES = {
     "EUR": 50_000,
     "GBP": 50_000,
     "BRL": 300_000,
+    "CLP": 50_000_000,
+    "COP": 200_000_000,
+    "CNY": 350_000,
 }
 
 

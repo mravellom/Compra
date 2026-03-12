@@ -7,7 +7,9 @@ import { Opportunity } from '../../models/opportunity.model';
   standalone: true,
   imports: [DecimalPipe, DatePipe],
   template: `
-    <div class="card flex flex-col gap-4 cursor-pointer" (click)="selected.emit(opp.id)">
+    <div class="card flex flex-col gap-4 cursor-pointer border-l-4"
+         [style.border-left-color]="routeColor"
+         (click)="selected.emit(opp.id)">
       <!-- Header: image + title -->
       <div class="flex gap-4">
         <div class="w-20 h-20 rounded-lg bg-surface-700 flex-shrink-0 overflow-hidden">
@@ -23,10 +25,17 @@ import { Opportunity } from '../../models/opportunity.model';
         <div class="flex-1 min-w-0">
           <h3 class="text-sm font-semibold text-white truncate">{{ opp.product_name }}</h3>
           <p class="text-xs text-gray-500 mt-1">{{ opp.created_at | date:'short' }}</p>
-          <div class="flex gap-2 mt-2">
+          <div class="flex items-center gap-2 mt-2">
+            <span class="inline-block w-2 h-2 rounded-full flex-shrink-0" [style.background-color]="routeColor"></span>
             <span class="badge bg-surface-600 text-gray-300">{{ opp.buy_marketplace }}</span>
             <span class="text-gray-600">→</span>
             <span class="badge bg-surface-600 text-gray-300">{{ opp.sell_marketplace }}</span>
+            @if (opp.route) {
+              <span class="text-[10px] font-medium px-1.5 py-0.5 rounded-full border"
+                    [style.border-color]="routeColor" [style.color]="routeColor">
+                {{ opp.route }}
+              </span>
+            }
           </div>
         </div>
       </div>
@@ -127,6 +136,30 @@ export class OpportunityCardComponent {
     if (s >= 75) return 'border-accent-green text-accent-green';
     if (s >= 50) return 'border-accent-yellow text-accent-yellow';
     return 'border-gray-600 text-gray-400';
+  }
+
+  /** Color de borde según ruta de países */
+  private static readonly ROUTE_COLORS: Record<string, string> = {
+    'MX→MX': '#3b82f6',   // azul — doméstico México
+    'US→MX': '#10b981',   // verde — US a México
+    'US→AR': '#8b5cf6',   // violeta — US a Argentina
+    'US→CL': '#06b6d4',   // cyan — US a Chile
+    'US→CO': '#14b8a6',   // teal — US a Colombia
+    'CN→MX': '#f59e0b',   // amarillo — China a México
+    'CN→AR': '#f97316',   // naranja — China a Argentina
+    'CN→CL': '#eab308',   // dorado — China a Chile
+    'CN→CO': '#d97706',   // ámbar — China a Colombia
+    'MX→CL': '#ec4899',   // rosa — México a Chile
+    'MX→AR': '#e11d48',   // rojo rosa — México a Argentina
+    'MX→CO': '#db2777',   // magenta — México a Colombia
+    'AR→MX': '#a855f7',   // púrpura — Argentina a México
+    'CL→MX': '#6366f1',   // índigo — Chile a México
+    'CO→MX': '#7c3aed',   // violeta oscuro — Colombia a México
+  };
+
+  get routeColor(): string {
+    const route = this.opp.route || '';
+    return OpportunityCardComponent.ROUTE_COLORS[route] || '#6b7280';
   }
 
   get confidenceBadgeClass(): string {

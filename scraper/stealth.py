@@ -292,6 +292,8 @@ class StealthSession:
         base_delay: float | None = None,
         max_retries: int = 3,
         skip_accept_encoding: bool = False,
+        extra_headers: dict[str, str] | None = None,
+        extra_cookies: dict[str, str] | None = None,
     ):
         self._proxy_pool = proxy_pool or ProxyPool()
         self._rate_limiter = rate_limiter or RateLimiter(requests_per_second=0.5, burst=2)
@@ -299,6 +301,8 @@ class StealthSession:
         self._base_delay = base_delay if base_delay is not None else self.BASE_DELAY
         self._max_retries = max_retries
         self._skip_accept_encoding = skip_accept_encoding
+        self._extra_headers = extra_headers or {}
+        self._extra_cookies = extra_cookies or {}
         self._client: httpx.AsyncClient | None = None
         self._request_count = 0
         self._current_proxy: str | None = None
@@ -319,10 +323,12 @@ class StealthSession:
 
         self._current_proxy = await self._proxy_pool.get_proxy() if self._proxy_pool.has_proxies else None
         headers = random_headers(self._accept_language, skip_accept_encoding=self._skip_accept_encoding)
+        headers.update(self._extra_headers)
 
         proxy_arg = self._current_proxy if self._current_proxy else None
         self._client = httpx.AsyncClient(
             headers=headers,
+            cookies=self._extra_cookies if self._extra_cookies else None,
             proxy=proxy_arg,
             follow_redirects=True,
             timeout=30,

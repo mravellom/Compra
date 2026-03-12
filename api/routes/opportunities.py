@@ -164,6 +164,8 @@ async def list_opportunities(
             image_url=buy_listing.image_url if buy_listing else None,
             status=opp.status,
             created_at=opp.created_at,
+            route=opp.route or "",
+            sell_tax=float(opp.sell_tax or 0),
             marketplace_fee=float(opp.marketplace_fee or 0),
             payment_fee=float(opp.payment_fee or 0),
             import_tax=float(opp.import_tax or 0),

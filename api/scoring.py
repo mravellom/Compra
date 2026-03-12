@@ -203,6 +203,7 @@ class ScoringInput:
     # Context flags
     is_cross_border: bool
     price_spread_pct: float  # (max - min) / avg across sell listings
+    route_difficulty: int = 1  # 1=easy, 2=medium, 3=hard
 
 
 @dataclass
@@ -291,8 +292,15 @@ def compute_risk_score(inp: ScoringInput) -> float:
     else:
         margin_risk = 95
 
-    # Cross-border risk
-    cross_border_risk = 70 if inp.is_cross_border else 10
+    # Cross-border risk — gradient based on route difficulty
+    if not inp.is_cross_border:
+        cross_border_risk = 10
+    elif inp.route_difficulty >= 3:
+        cross_border_risk = 85  # Hard routes: high import tax, long shipping
+    elif inp.route_difficulty >= 2:
+        cross_border_risk = 60  # Medium routes
+    else:
+        cross_border_risk = 40  # Easy cross-border (e.g. US→MX)
 
     risk = (
         volatility_risk * RISK_WEIGHTS["volatility_risk"]

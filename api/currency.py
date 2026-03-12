@@ -22,6 +22,7 @@ FALLBACK_RATES: dict[str, float] = {
     "BRL": 5.10,
     "CLP": 950.0,
     "COP": 4100.0,
+    "CNY": 7.25,
 }
 
 # Multiple sources for resilience

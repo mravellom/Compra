@@ -16,6 +16,8 @@ load_dotenv()
 import redis.asyncio as redis
 
 from .amazon_scraper import AmazonScraper
+from .amazon_us_scraper import AmazonUSScraper
+from .aliexpress_scraper import AliExpressScraper
 from .ebay_scraper import EbayScraper
 from .mercadolibre_scraper import MercadoLibreScraper
 from .amazon_category_crawler import AmazonCategoryCrawler
@@ -147,7 +149,11 @@ async def main() -> None:
         scrapers = [
             MercadoLibreScraper("mercadolibre_ar", rate_limiter=rate_limiter, proxy_pool=proxy_pool),
             MercadoLibreScraper("mercadolibre_mx", rate_limiter=rate_limiter, proxy_pool=proxy_pool),
+            MercadoLibreScraper("mercadolibre_cl", rate_limiter=rate_limiter, proxy_pool=proxy_pool),
+            MercadoLibreScraper("mercadolibre_co", rate_limiter=rate_limiter, proxy_pool=proxy_pool),
             AmazonScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
+            AmazonUSScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
+            AliExpressScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
             EbayScraper(),
         ]
         marketplace_names = ", ".join(s.marketplace_id for s in scrapers)
@@ -181,6 +187,12 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
+        # Close shared Playwright browser if it was used
+        try:
+            from .browser import close_shared_browser
+            await close_shared_browser()
+        except Exception:
+            pass
         await redis_client.aclose()
         logger.info("Shutdown complete")
 

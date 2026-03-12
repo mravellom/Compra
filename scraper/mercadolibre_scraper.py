@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from urllib.parse import quote_plus
@@ -17,13 +18,34 @@ ML_SITES = {
         "url": "https://listado.mercadolibre.com.ar/{query}",
         "currency": "ARS",
         "lang": "es-AR,es;q=0.9,en;q=0.8",
+        "needs_js": False,
     },
     "mercadolibre_mx": {
         "url": "https://listado.mercadolibre.com.mx/{query}",
         "currency": "MXN",
         "lang": "es-MX,es;q=0.9,en;q=0.8",
+        "needs_js": False,
+    },
+    "mercadolibre_cl": {
+        "url": "https://listado.mercadolibre.cl/{query}",
+        "currency": "CLP",
+        "lang": "es-CL,es;q=0.9,en;q=0.8",
+        "needs_js": True,
+        "locale": "es-CL",
+        "timezone": "America/Santiago",
+    },
+    "mercadolibre_co": {
+        "url": "https://listado.mercadolibre.com.co/{query}",
+        "currency": "COP",
+        "lang": "es-CO,es;q=0.9,en;q=0.8",
+        "needs_js": True,
+        "locale": "es-CO",
+        "timezone": "America/Bogota",
     },
 }
+
+# Sites that serve a JS bot challenge requiring a real browser
+_JS_SITES = {sid for sid, cfg in ML_SITES.items() if cfg.get("needs_js")}
 
 
 class MercadoLibreScraper:
@@ -38,10 +60,19 @@ class MercadoLibreScraper:
         self._search_url = config["url"]
         self._currency = config["currency"]
         self._lang = config["lang"]
+        self._needs_js = config.get("needs_js", False)
+        self._locale = config.get("locale", "es-MX")
+        self._timezone = config.get("timezone", "America/Mexico_City")
         self._rate_limiter = rate_limiter
         self._proxy_pool = proxy_pool
 
     async def scrape(self, search_term: str, max_results: int = 20) -> list[RawListing]:
+        if self._needs_js:
+            return await self._scrape_with_playwright(search_term, max_results)
+        return await self._scrape_with_httpx(search_term, max_results)
+
+    # ── httpx path (AR, MX) ──────────────────────────────────
+    async def _scrape_with_httpx(self, search_term: str, max_results: int) -> list[RawListing]:
         listings: list[RawListing] = []
         query = quote_plus(search_term).replace("+", "-")
         url = self._search_url.format(query=query)
@@ -74,6 +105,87 @@ class MercadoLibreScraper:
         logger.info("Scraped %d listings for '%s'", len(listings), search_term)
         return listings
 
+    # ── Playwright path (CL, CO) ─────────────────────────────
+    async def _scrape_with_playwright(self, search_term: str, max_results: int) -> list[RawListing]:
+        from .browser import get_shared_browser
+
+        listings: list[RawListing] = []
+        query = quote_plus(search_term).replace("+", "-")
+        url = self._search_url.format(query=query)
+        logger.info("[Playwright] Fetching %s", url)
+
+        browser_mgr = await get_shared_browser()
+        page = await browser_mgr.new_page(
+            locale=self._locale,
+            timezone_id=self._timezone,
+        )
+
+        try:
+            # Navigate and wait for the bot challenge to resolve
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # Wait for the real content — the challenge page auto-reloads
+            # after solving the SHA-256 verification
+            try:
+                await page.wait_for_selector(
+                    ".ui-search-layout__item",
+                    timeout=20000,
+                )
+            except Exception:
+                # Check if we're still on a challenge page
+                content = await page.content()
+                if len(content) < 5000 and "_bmstate" in content:
+                    logger.warning(
+                        "[%s] Bot challenge not resolved after 20s, retrying...",
+                        self.marketplace_id,
+                    )
+                    # Give it more time — the challenge JS needs to run
+                    await asyncio.sleep(5)
+                    try:
+                        await page.wait_for_selector(
+                            ".ui-search-layout__item",
+                            timeout=15000,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Could not bypass bot challenge for '%s'",
+                            self.marketplace_id, search_term,
+                        )
+                        return []
+                else:
+                    logger.warning(
+                        "[%s] No search results found for '%s' (page length: %d)",
+                        self.marketplace_id, search_term, len(content),
+                    )
+                    return []
+
+            # Get the fully rendered HTML
+            html = await page.content()
+
+        except Exception:
+            logger.error(
+                "[Playwright] Error fetching %s for '%s'",
+                self.marketplace_id, search_term, exc_info=True,
+            )
+            return []
+        finally:
+            await page.close()
+
+        soup = BeautifulSoup(html, "html.parser")
+        items = soup.select(".ui-search-layout__item")
+
+        for item in items[:max_results]:
+            try:
+                listing = self._parse_item(item)
+                if listing:
+                    listings.append(listing)
+            except Exception:
+                logger.debug("Skipping ML item, parse error", exc_info=True)
+
+        logger.info("[Playwright] Scraped %d listings for '%s'", len(listings), search_term)
+        return listings
+
+    # ── Parsing (shared by both paths) ───────────────────────
     def _parse_item(self, item) -> RawListing | None:
         title_el = item.select_one(".poly-component__title")
         if not title_el:
