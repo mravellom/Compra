@@ -100,6 +100,8 @@ class PlaywrightBrowser:
         """)
 
         page = await context.new_page()
+        # Store context ref so callers can close it
+        page._browser_context = context
         return page
 
     async def close(self) -> None:

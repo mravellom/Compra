@@ -16,19 +16,19 @@ from .categorizer import classify_product
 
 logger = logging.getLogger(__name__)
 
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.88"))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.82"))
 
 # Lower threshold when brand+model match confirms identity
-BRAND_MODEL_SIMILARITY_THRESHOLD = 0.65
+BRAND_MODEL_SIMILARITY_THRESHOLD = float(os.getenv("BRAND_MODEL_THRESHOLD", "0.60"))
 
 # Lower threshold when only brand matches (same brand, similar product)
-# 0.80 prevents merging different products from same brand
-# (e.g. WH-1000XM4 vs WF-1000XM4, Magic Keyboard iMac vs iPad)
-BRAND_ONLY_SIMILARITY_THRESHOLD = 0.80
+# 0.75 allows more cross-marketplace matches while still preventing
+# clearly different products (e.g. WH-1000XM4 vs WF-1000XM4)
+BRAND_ONLY_SIMILARITY_THRESHOLD = float(os.getenv("BRAND_ONLY_THRESHOLD", "0.75"))
 
 # Maximum price ratio between a new listing and existing master product listings.
 # Prevents matching e.g. "Airpods Pro ($250)" with "Airpods case ($15)".
-MATCH_MAX_PRICE_RATIO = 3.0
+MATCH_MAX_PRICE_RATIO = float(os.getenv("MATCH_MAX_PRICE_RATIO", "3.5"))
 
 
 @dataclass

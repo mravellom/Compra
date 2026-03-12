@@ -1,35 +1,44 @@
 """
-Opportunity Scoring System v2.
+Opportunity Scoring System v3.
 
 Produces three scores per opportunity:
   - opportunity_score (0-100): overall quality ranking
   - risk_score (0-100): downside/failure probability (lower = safer)
   - confidence_score (0-100): data reliability (higher = more trustworthy)
 
-Six input factors:
-  1. price_margin      - net profit margin after all fees
-  2. listing_volume    - number of competing listings (liquidity proxy)
-  3. seller_reputation - buy/sell side seller quality
-  4. marketplace_demand - estimated sales velocity and depth
-  5. price_volatility  - price stability over time (from price_history)
-  6. historical_sales  - observed sales frequency and review velocity
+Seven input factors:
+  1. price_margin       - net profit margin after all fees
+  2. marketplace_demand - estimated sales velocity and depth
+  3. historical_sales   - observed sales frequency and review velocity
+  4. price_volatility   - price stability over time (from price_history)
+  5. competition        - number of competing listings (liquidity proxy)
+  6. seller_reputation  - buy/sell side seller quality
+  7. price_stability    - CV-based price consistency
+
+v3 changes:
+  - Rebalanced weights: demand + sales = 45% (reseller focus)
+  - Soft penalty system: thin margins, high ratios, low trust reduce score
+  - Cross-border risk scaled down: domestic=10, easy=30, medium=50, hard=70
+  - Margin risk tiers adjusted for 3-8% realistic arbitrage margins
 
 ─────────────────────────────────────────────────────────────────
 FORMULAS
 
   opportunity_score = Σ(normalized_factor_i × weight_i)
+                    - soft_penalty
 
   risk_score = w1 × volatility_risk + w2 × competition_risk
              + w3 × liquidity_risk  + w4 × margin_risk
              + w5 × cross_border_risk
 
   confidence_score = data_coverage × signal_strength × consistency
+                   - confidence_penalty
 
 ─────────────────────────────────────────────────────────────────
 """
 import math
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # ── Factor normalization (all produce 0-100) ────────────────
 
@@ -138,16 +147,17 @@ def _normalize_sales_frequency(
     return min(100, 100 * (1 - math.exp(-0.5 * estimated_daily)))
 
 
-# ── Scoring Weights ─────────────────────────────────────────
+# ── Scoring Weights (v3: rebalanced for reseller focus) ────
 
 # Opportunity score weights (sum = 1.0)
 OPP_WEIGHTS = {
-    "price_margin": 0.25,     # Most important: actual profit potential
-    "listing_volume": 0.10,   # Market liquidity
-    "seller_reputation": 0.10,  # Trust in counterparties
-    "marketplace_demand": 0.20,  # Will it actually sell?
-    "price_volatility": 0.15,   # Price stability
-    "historical_sales": 0.20,   # Proven sales track record
+    "price_margin": 0.20,        # Profit potential
+    "marketplace_demand": 0.25,  # Will it sell? (highest weight)
+    "historical_sales": 0.20,    # Proven sales track record
+    "price_volatility": 0.10,    # Price stability
+    "listing_volume": 0.10,      # Market liquidity / competition
+    "seller_reputation": 0.10,   # Trust in counterparties
+    "price_stability": 0.05,     # CV-based price consistency
 }
 
 # Risk score weights (sum = 1.0)
@@ -205,6 +215,10 @@ class ScoringInput:
     price_spread_pct: float  # (max - min) / avg across sell listings
     route_difficulty: int = 1  # 1=easy, 2=medium, 3=hard
 
+    # v3: Soft penalties from opportunity engine
+    soft_penalty: float = 0.0         # Deducted from opportunity_score
+    confidence_penalty: float = 0.0   # Deducted from confidence_score
+
 
 @dataclass
 class ScoringOutput:
@@ -222,15 +236,16 @@ class ScoringOutput:
 
 def compute_opportunity_score(inp: ScoringInput) -> float:
     """
-    opportunity_score = Σ(normalized_factor × weight)
+    opportunity_score = Σ(normalized_factor × weight) - soft_penalty
 
     Factors:
-      price_margin:      margin normalized (50% = 100)
-      listing_volume:    log-scaled competitor count
-      seller_reputation: weighted avg of buy/sell ratings + review volume
+      price_margin:       margin normalized (50% = 100)
       marketplace_demand: sales + reviews + depth estimation
-      price_volatility:  stability from CV of price_history
-      historical_sales:  sales frequency relative to listing age
+      historical_sales:   sales frequency relative to listing age
+      price_volatility:   stability from CV of price_history
+      listing_volume:     log-scaled competitor count
+      seller_reputation:  weighted avg of buy/sell ratings + review volume
+      price_stability:    same as volatility (CV-based, secondary weight)
     """
     factors = _compute_factors(inp)
 
@@ -245,7 +260,10 @@ def compute_opportunity_score(inp: ScoringInput) -> float:
 
     # Penalty: extremely low volume = illiquid, risky even if profitable
     if factors["listing_volume"] < 15:
-        score *= 0.85
+        score *= 0.90  # v3: softer penalty (was 0.85)
+
+    # v3: Apply soft penalties from opportunity engine
+    score -= inp.soft_penalty
 
     return round(max(0, min(100, score)), 1)
 
@@ -280,27 +298,29 @@ def compute_risk_score(inp: ScoringInput) -> float:
     # Liquidity risk: inverse of demand
     liquidity_risk = max(0, 100 - factors["marketplace_demand"])
 
-    # Margin risk: thin margins amplify losses
+    # Margin risk: v3 adjusted tiers for realistic arbitrage (3-8% margins are common)
     if inp.margin > 0.40:
         margin_risk = 10
     elif inp.margin > 0.25:
-        margin_risk = 30
+        margin_risk = 25
     elif inp.margin > 0.15:
-        margin_risk = 55
+        margin_risk = 40
     elif inp.margin > 0.08:
-        margin_risk = 75
+        margin_risk = 55
+    elif inp.margin > 0.05:
+        margin_risk = 70  # Thin but viable for volume resellers
     else:
-        margin_risk = 95
+        margin_risk = 85  # Very thin, high risk
 
-    # Cross-border risk — gradient based on route difficulty
+    # Cross-border risk — v3: scaled down to avoid over-penalizing
     if not inp.is_cross_border:
-        cross_border_risk = 10
+        cross_border_risk = 10   # Domestic
     elif inp.route_difficulty >= 3:
-        cross_border_risk = 85  # Hard routes: high import tax, long shipping
+        cross_border_risk = 70   # Hard routes (was 85)
     elif inp.route_difficulty >= 2:
-        cross_border_risk = 60  # Medium routes
+        cross_border_risk = 50   # Medium routes (was 60)
     else:
-        cross_border_risk = 40  # Easy cross-border (e.g. US→MX)
+        cross_border_risk = 30   # Easy cross-border (was 40)
 
     risk = (
         volatility_risk * RISK_WEIGHTS["volatility_risk"]
@@ -312,7 +332,12 @@ def compute_risk_score(inp: ScoringInput) -> float:
 
     # Outlier ROI penalty: if ROI > 200%, something might be wrong
     if inp.roi > 2.0:
-        risk = min(100, risk + 15)
+        risk = min(100, risk + 10)  # v3: softer penalty (was +15)
+
+    # v3: Low seller rating increases risk
+    for rating in [inp.buy_seller_rating, inp.sell_seller_rating]:
+        if rating is not None and rating < 3.0:
+            risk = min(100, risk + 5)
 
     return round(max(0, min(100, risk)), 1)
 
@@ -351,7 +376,6 @@ def compute_confidence_score(inp: ScoringInput) -> tuple[float, str]:
     # Signal agreement: check if positive signals align
     factors = _compute_factors(inp)
     positive_factors = [v for v in factors.values() if v > 50]
-    negative_factors = [v for v in factors.values() if v <= 50]
 
     # Strong agreement = most factors point the same direction
     if len(positive_factors) >= 5:
@@ -386,6 +410,10 @@ def compute_confidence_score(inp: ScoringInput) -> tuple[float, str]:
         + signal_agreement * CONFIDENCE_FACTORS["signal_agreement"]
         + recency * CONFIDENCE_FACTORS["recency"]
     )
+
+    # v3: Apply confidence penalty from opportunity engine (high price ratio, etc.)
+    confidence -= inp.confidence_penalty
+
     confidence = round(max(0, min(100, confidence)), 1)
 
     level = "high" if confidence >= 70 else "medium" if confidence >= 45 else "low"
@@ -395,23 +423,25 @@ def compute_confidence_score(inp: ScoringInput) -> tuple[float, str]:
 # ── Factor computation (shared) ─────────────────────────────
 
 def _compute_factors(inp: ScoringInput) -> dict[str, float]:
-    """Compute all 6 normalized factors from raw input."""
+    """Compute all 7 normalized factors from raw input."""
+    volatility = _normalize_volatility(inp.price_stability_score)
     return {
         "price_margin": _normalize_margin(inp.margin),
+        "marketplace_demand": _normalize_demand(
+            inp.total_sales_count, inp.total_reviews_count,
+            inp.estimated_daily_sales, inp.market_depth_score,
+        ),
+        "historical_sales": _normalize_sales_frequency(
+            inp.total_sales_count, inp.total_reviews_count,
+            inp.listing_age_days,
+        ),
+        "price_volatility": volatility,
         "listing_volume": _normalize_listing_volume(inp.competitor_count),
         "seller_reputation": _normalize_seller_reputation(
             inp.buy_seller_rating, inp.sell_seller_rating,
             inp.buy_seller_reviews, inp.sell_seller_reviews,
         ),
-        "marketplace_demand": _normalize_demand(
-            inp.total_sales_count, inp.total_reviews_count,
-            inp.estimated_daily_sales, inp.market_depth_score,
-        ),
-        "price_volatility": _normalize_volatility(inp.price_stability_score),
-        "historical_sales": _normalize_sales_frequency(
-            inp.total_sales_count, inp.total_reviews_count,
-            inp.listing_age_days,
-        ),
+        "price_stability": volatility,  # Secondary weight on same signal
     }
 
 
@@ -435,9 +465,9 @@ def score(inp: ScoringInput) -> ScoringOutput:
             is_cross_border=False, price_spread_pct=0.15,
         )
         result = score(inp)
-        # result.opportunity_score = 71.2
-        # result.risk_score = 32.5
-        # result.confidence_score = 78.0
+        # result.opportunity_score = 68.5
+        # result.risk_score = 34.2
+        # result.confidence_score = 75.0
     """
     opp_score = compute_opportunity_score(inp)
     risk = compute_risk_score(inp)

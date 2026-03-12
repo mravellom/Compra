@@ -1,33 +1,32 @@
 """
-Advanced Arbitrage Detection Engine v2.
+Advanced Arbitrage Detection Engine v3.
 
-Key improvements over v1:
-- SQL-first candidate filtering (push work to Postgres)
-- Upsert-based opportunity management (no expire-all-then-redetect)
-- Cached currency conversion with TTL
-- Configurable thresholds via env
-- Supports all conditions (new, refurbished, used)
-- Percentage margin in output
-- Batch processing for memory efficiency
-- IQR outlier removal per product cluster
+Key changes from v2 → v3:
+- Soft-filter model: most checks become scoring penalties, not hard rejections
+- Relaxed hard thresholds to match real reseller conditions (3% margin, $3 profit)
+- 48h freshness window instead of 24h
+- Higher MAX_ROI (500%) and MAX_PRICE_RATIO (8x) with scoring penalties
+- Seller trust is a soft signal: rating < 1.5 is hard reject, < 3.0 is risk penalty
+- Cross-border risk scaled down to avoid over-penalizing international routes
 
 Algorithm:
 1. Fetch exchange rates (cached 1h TTL)
-2. SQL: find products with listings in 2+ marketplaces, pre-filter by condition
+2. SQL: find products with listings in 2+ marketplaces (48h window)
 3. For each product cluster:
    a. Convert all prices to USD
    b. Remove statistical outliers (IQR method)
-   c. Filter untrusted sellers (rating < 2.0)
+   c. Hard-reject sellers with rating < 1.5
    d. Check variant/condition compatibility
    e. For each (buy_mp, sell_mp) pair:
       - Buy price = cheapest on buy_mp
       - Sell price = median on sell_mp * 0.97 (undercut)
       - Calculate all fees, shipping, import tax
       - Net profit = sell - buy - all_costs
-      - Margin = net_profit / sell_price
+      - Hard-reject only if profit < $3, margin < 3%, ROI < 2%
+      - Apply soft penalties for thin margins, high ratios, low trust
    f. Keep best opportunity per product (highest score)
 4. Upsert: update existing active opps, create new ones, expire stale
-5. Score 0-100 composite, rank by score
+5. Score 0-100 composite with soft penalties, rank by score
 """
 import asyncio
 import logging
@@ -58,13 +57,14 @@ from .scoring import ScoringInput, score as score_opportunity_v2
 
 logger = logging.getLogger(__name__)
 
-# ── Configurable thresholds ───────────────────────────────
-MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "5"))
-MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.10"))       # 10%
-MIN_ROI = float(os.getenv("MIN_ROI", "0.05"))             # 5%
-MAX_ROI = float(os.getenv("MAX_ROI", "3.0"))              # 300% — anything above is likely bad data/scam
-MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "5.0"))  # sell/buy > 5x = mismatched products or scam listing
-STALE_HOURS = int(os.getenv("STALE_HOURS", "24"))         # expire opps older than this
+# ── Configurable thresholds (v3: relaxed hard filters) ────
+MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "3"))
+MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.03"))       # 3% — soft penalties below 8%
+MIN_ROI = float(os.getenv("MIN_ROI", "0.02"))             # 2%
+MAX_ROI = float(os.getenv("MAX_ROI", "5.0"))              # 500% — allowed but penalized above 200%
+MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "8.0"))  # 8x — allowed but penalized above 6x
+MIN_SELLER_RATING = float(os.getenv("MIN_SELLER_RATING", "1.5"))  # hard floor
+STALE_HOURS = int(os.getenv("STALE_HOURS", "48"))         # 48h freshness window
 
 # ── Data structures ───────────────────────────────────────
 @dataclass
@@ -155,7 +155,9 @@ def is_outlier_price(price: float, prices: list[float]) -> bool:
 
 
 def is_trustworthy(listing: ProductListing) -> bool:
-    if listing.seller_rating is not None and listing.seller_rating < 2.0:
+    """Hard reject only extremely untrustworthy sellers (< 1.5).
+    Low-but-passable ratings (1.5-3.0) are handled as scoring penalties."""
+    if listing.seller_rating is not None and listing.seller_rating < MIN_SELLER_RATING:
         return False
     return True
 
@@ -426,11 +428,10 @@ async def detect_opportunities(db: AsyncSession) -> list[Opportunity]:
     await db.flush()
 
     # Step 2: Find products with FRESH listings in 2+ marketplaces (SQL-first)
-    # Only consider listings scraped in the last 24h to avoid ghost opportunities
-    result = await db.execute(text("""
+    result = await db.execute(text(f"""
         SELECT pl.master_product_id, COUNT(DISTINCT pl.marketplace_id) AS mp_count
         FROM product_listings pl
-        WHERE pl.scraped_at > NOW() - INTERVAL '24 hours'
+        WHERE pl.scraped_at > NOW() - INTERVAL '{STALE_HOURS} hours'
         GROUP BY pl.master_product_id
         HAVING COUNT(DISTINCT pl.marketplace_id) >= 2
         ORDER BY COUNT(DISTINCT pl.id) DESC
@@ -488,8 +489,7 @@ async def _analyze_product(
     db: AsyncSession, product_id: int, rates: dict[str, float]
 ) -> Opportunity | None:
     """Analyze a single product cluster for arbitrage. Returns best opportunity or None."""
-    # Load only fresh listings (scraped in last 24h)
-    freshness_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    freshness_cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_HOURS)
     result = await db.execute(
         select(ProductListing)
         .where(
@@ -570,6 +570,7 @@ async def _analyze_product(
                 buy_candidate.is_free_shipping, sell_candidate.is_free_shipping,
             )
 
+            # ── Hard filters (only reject clearly invalid data) ────
             if calc.net_profit < MIN_PROFIT_USD:
                 continue
             if calc.margin < MIN_MARGIN:
@@ -577,7 +578,6 @@ async def _analyze_product(
             if calc.roi < MIN_ROI:
                 continue
 
-            # Guard: reject absurd price ratios (likely mismatched products)
             price_ratio = sell_usd / buy_usd if buy_usd > 0 else float("inf")
             if price_ratio > MAX_PRICE_RATIO:
                 logger.warning(
@@ -591,6 +591,32 @@ async def _analyze_product(
                     calc.roi * 100, product_id, buy_mp, sell_mp,
                 )
                 continue
+
+            # ── Soft penalties (reduce score, don't reject) ──────
+            soft_penalty = 0.0
+            confidence_penalty = 0.0
+
+            # Thin margin penalties
+            if calc.margin < 0.05:
+                soft_penalty += 15  # margin < 5%
+            elif calc.margin < 0.08:
+                soft_penalty += 10  # margin < 8%
+
+            # High price ratio reduces confidence
+            if price_ratio > 6.0:
+                confidence_penalty += 15
+
+            # Low seller ratings increase risk (handled in scoring via input)
+            # but also apply a direct score penalty for very low ratings
+            buy_rating = buy_candidate.seller_rating
+            sell_rating = sell_candidate.seller_rating
+            if (buy_rating is not None and buy_rating < 3.0) or \
+               (sell_rating is not None and sell_rating < 3.0):
+                soft_penalty += 5
+
+            # High competition penalty
+            if comp.competitor_count > 20:
+                soft_penalty += 10
 
             # Scoring signals
             stability = await compute_stability(db, sell_candidate.url)
@@ -628,6 +654,8 @@ async def _analyze_product(
                 is_cross_border=is_cross_border(buy_mp, sell_mp),
                 price_spread_pct=price_spread,
                 route_difficulty=get_route_difficulty(buy_mp, sell_mp),
+                soft_penalty=soft_penalty,
+                confidence_penalty=confidence_penalty,
             )
             result = score_opportunity_v2(scoring_input)
 
