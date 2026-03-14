@@ -58,9 +58,9 @@ from .scoring import ScoringInput, score as score_opportunity_v2
 logger = logging.getLogger(__name__)
 
 # ── Configurable thresholds (v3: relaxed hard filters) ────
-MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "3"))
-MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.03"))       # 3% — soft penalties below 8%
-MIN_ROI = float(os.getenv("MIN_ROI", "0.02"))             # 2%
+MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "1"))
+MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.01"))       # 1% — soft penalties below 8%
+MIN_ROI = float(os.getenv("MIN_ROI", "0.01"))             # 1%
 MAX_ROI = float(os.getenv("MAX_ROI", "5.0"))              # 500% — allowed but penalized above 200%
 MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "8.0"))  # 8x — allowed but penalized above 6x
 MIN_SELLER_RATING = float(os.getenv("MIN_SELLER_RATING", "1.5"))  # hard floor

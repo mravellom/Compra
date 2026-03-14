@@ -1,9 +1,11 @@
+import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
 load_dotenv()
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -16,11 +18,40 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
+
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))  # 5 minutes
+
+
+async def _auto_scan_loop():
+    """Background task: scan for opportunities every SCAN_INTERVAL seconds."""
+    from .opportunity import detect_opportunities
+    from .database import async_session
+
+    await asyncio.sleep(30)  # wait for startup
+    while True:
+        try:
+            async with async_session() as db:
+                opps = await detect_opportunities(db)
+                logger.info("Auto-scan: %d opportunities found", len(opps))
+        except Exception:
+            logger.error("Auto-scan error", exc_info=True)
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_auto_scan_loop())
+    logger.info("Auto-scan started (every %ds)", SCAN_INTERVAL)
+    yield
+    task.cancel()
+
 
 app = FastAPI(
     title="Radar de Oportunidades API",
     description="API para deteccion de arbitraje entre marketplaces",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 ALLOWED_ORIGINS = os.getenv(
