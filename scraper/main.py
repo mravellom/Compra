@@ -1,12 +1,17 @@
 """
-Scraper entrypoint — category-based crawling architecture.
-
-Crawls 7 marketplaces across 19+ categories with pagination,
-deduplication, and smart category expansion.
+Scraper entrypoint — multi-mode scraping architecture.
 
 Modes:
-  SCRAPER_MODE=category (default) — category crawling with pagination
-  SCRAPER_MODE=search   — legacy keyword search
+  SCRAPER_MODE=orchestrated (default) — category + search + trending rotation
+  SCRAPER_MODE=category   — category-only crawling (legacy)
+  SCRAPER_MODE=search     — keyword search only (legacy)
+
+The orchestrated mode rotates between:
+  60% category crawling (with subcategory discovery + prioritization)
+  25% expanded keyword search
+  15% trending/bestseller discovery
+
+Target: 60,000–120,000 listings per cycle.
 """
 import asyncio
 import logging
@@ -35,9 +40,6 @@ from .rate_limiter import RateLimiter
 from .schemas import RawListing
 from .stealth import ProxyPool
 
-# Legacy search imports (only loaded if mode=search)
-_search_imports_loaded = False
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -48,7 +50,7 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAM_KEY = "raw_listings_queue"
 SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "300"))
-SCRAPER_MODE = os.getenv("SCRAPER_MODE", "category")
+SCRAPER_MODE = os.getenv("SCRAPER_MODE", "orchestrated")
 
 # Search mode config (legacy)
 SEARCH_TERMS = os.getenv("SEARCH_TERMS", "sony wh-1000xm4,airpods pro,nintendo switch")
@@ -62,7 +64,7 @@ CATEGORY_MAX_PAGES = int(os.getenv("CATEGORY_MAX_PAGES", str(DEFAULT_MAX_PAGES))
 SMART_EXPANSION = os.getenv("SMART_EXPANSION", "true").lower() == "true"
 EXPANSION_MULTIPLIER = float(os.getenv("EXPANSION_MULTIPLIER", "1.5"))
 
-# Stats tracking for smart expansion
+# Stats tracking for smart expansion (category-only mode)
 _category_stats: dict[str, dict] = {}
 
 
@@ -71,15 +73,37 @@ async def publish_to_stream(redis_client: redis.Redis, listing: RawListing) -> s
     return msg_id
 
 
+# ── Batch size for Redis pipeline (number of XADDs per round-trip) ──
+_PUBLISH_CHUNK_SIZE = int(os.getenv("PUBLISH_CHUNK_SIZE", "100"))
+
+
 async def publish_batch(redis_client: redis.Redis, listings: list[RawListing]) -> int:
-    """Publish a batch of listings to Redis. Returns count published."""
+    """Publish a batch of listings to Redis using pipeline batching.
+
+    Groups listings into chunks and sends each chunk in a single Redis
+    pipeline round-trip (N XADDs per pipeline.execute() instead of N
+    individual round-trips).
+    """
+    if not listings:
+        return 0
+
     count = 0
-    for listing in listings:
+    for i in range(0, len(listings), _PUBLISH_CHUNK_SIZE):
+        chunk = listings[i : i + _PUBLISH_CHUNK_SIZE]
         try:
-            await publish_to_stream(redis_client, listing)
-            count += 1
+            async with redis_client.pipeline(transaction=False) as pipe:
+                for listing in chunk:
+                    pipe.xadd(STREAM_KEY, listing.to_stream_dict())
+                results = await pipe.execute()
+                count += sum(1 for r in results if r is not None)
         except Exception:
-            logger.error("Failed to publish listing: %s", listing.title[:40], exc_info=True)
+            # Fallback: publish remaining one by one
+            for listing in chunk:
+                try:
+                    await redis_client.xadd(STREAM_KEY, listing.to_stream_dict())
+                    count += 1
+                except Exception:
+                    logger.error("Failed to publish listing: %s", listing.title[:40], exc_info=True)
     return count
 
 
@@ -118,7 +142,7 @@ def _update_stats(category_slug: str, marketplace: str, listings_count: int, pag
         )
 
 
-# ── Category mode ─────────────────────────────────────────
+# ── Category mode (legacy) ───────────────────────────────────
 async def run_category_cycle(
     crawlers: list,
     redis_client: redis.Redis,
@@ -199,7 +223,7 @@ def _build_category_list() -> list[str]:
     if env_cats:
         return [c.strip() for c in env_cats.split(",") if c.strip()]
 
-    # Use common categories (present in 3+ marketplaces) for best arbitrage coverage
+    # Use common categories (present in 2+ marketplaces) for best arbitrage coverage
     common = get_common_categories()
     if common:
         return common
@@ -270,8 +294,43 @@ async def main() -> None:
     else:
         logger.info("No proxies configured (set PROXY_URLS env var for proxy rotation)")
 
-    # Build scraper/crawler list based on mode
-    if SCRAPER_MODE == "category":
+    # ── Orchestrated mode (default — full multi-mode rotation) ──
+    if SCRAPER_MODE == "orchestrated":
+        from .scraping_orchestrator import ScrapingOrchestrator
+
+        categories = _build_category_list()
+        crawlers = _build_crawlers(rate_limiter, proxy_pool)
+        search_scrapers = _build_search_scrapers(rate_limiter, proxy_pool)
+        dedup = DedupFilter(redis_client)
+
+        orchestrator = ScrapingOrchestrator(
+            crawlers=crawlers,
+            search_scrapers=search_scrapers,
+            redis_client=redis_client,
+            dedup=dedup,
+            categories=categories,
+        )
+        orchestrator.set_trending_scraper_infra(rate_limiter, proxy_pool)
+
+        marketplace_names = ", ".join(c.marketplace_id for c in crawlers)
+        logger.info("Orchestrated mode — crawlers: %s", marketplace_names)
+        logger.info(
+            "Categories (%d): %s", len(categories), ", ".join(categories[:15]),
+        )
+        if len(categories) > 15:
+            logger.info("  ... and %d more categories", len(categories) - 15)
+        logger.info("Search scrapers: %d | Search terms will be auto-expanded", len(search_scrapers))
+
+        # Estimate
+        est_low = len(categories) * len(crawlers) * CATEGORY_MAX_PAGES * 20
+        est_high = len(categories) * len(crawlers) * CATEGORY_MAX_PAGES * 50
+        logger.info(
+            "Estimated category listings per cycle: %d – %d (+ search + trending)",
+            est_low, est_high,
+        )
+
+    # ── Category mode (legacy — categories only) ──
+    elif SCRAPER_MODE == "category":
         categories = _build_category_list()
         crawlers = _build_crawlers(rate_limiter, proxy_pool)
         dedup = DedupFilter(redis_client)
@@ -284,7 +343,6 @@ async def main() -> None:
         )
         logger.info("Smart expansion: %s (multiplier: %.1fx)", SMART_EXPANSION, EXPANSION_MULTIPLIER)
 
-        # Estimate
         est_low = len(categories) * len(crawlers) * CATEGORY_MAX_PAGES * 20
         est_high = len(categories) * len(crawlers) * CATEGORY_MAX_PAGES * 50
         logger.info("Estimated listings per cycle: %d - %d", est_low, est_high)
@@ -307,8 +365,10 @@ async def main() -> None:
     # Main loop
     try:
         while not stop_event.is_set():
-            if SCRAPER_MODE == "category":
-                dedup.reset()  # Fresh dedup set each cycle
+            if SCRAPER_MODE == "orchestrated":
+                total = await orchestrator.run_cycle()
+            elif SCRAPER_MODE == "category":
+                dedup.reset()
                 total = await run_category_cycle(crawlers, redis_client, categories, dedup)
             else:
                 total = await run_search_cycle(scrapers, redis_client)
@@ -317,7 +377,7 @@ async def main() -> None:
                 "Cycle complete: %d listings published to '%s'", total, STREAM_KEY
             )
 
-            # Log smart expansion stats
+            # Log smart expansion stats (category mode)
             if SCRAPER_MODE == "category" and _category_stats:
                 top = sorted(
                     _category_stats.items(),

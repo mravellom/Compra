@@ -27,6 +27,13 @@ KNOWN_BRANDS = frozenset({
     "joby", "zhiyun", "osmo", "insta360", "tile", "chipolo",
 })
 
+# ── Pre-compiled regex patterns ──────────────────────────────
+# Compiled once at module load, reused on every call.
+_RE_SPECIAL_CHARS = re.compile(r"[^a-z0-9\s\-]")
+_RE_DASH_ALPHA_NUM = re.compile(r"(?<=[a-z])-(?=[0-9])")
+_RE_DASH_NUM_ALPHA = re.compile(r"(?<=[0-9])-(?=[a-z])")
+_RE_MODEL_PATTERN = re.compile(r"^(?=[a-z]*\d)[a-z0-9]{3,}$")
+
 
 def normalize_title(title: str) -> str:
     """Limpia un título de listing para matching."""
@@ -37,11 +44,11 @@ def normalize_title(title: str) -> str:
     text = "".join(c for c in text if not unicodedata.combining(c))
 
     # Remover caracteres especiales, conservar alfanuméricos y espacios
-    text = re.sub(r"[^a-z0-9\s\-]", " ", text)
+    text = _RE_SPECIAL_CHARS.sub(" ", text)
 
     # Normalizar guiones (wh-1000xm4 -> wh1000xm4)
-    text = re.sub(r"(?<=[a-z])-(?=[0-9])", "", text)
-    text = re.sub(r"(?<=[0-9])-(?=[a-z])", "", text)
+    text = _RE_DASH_ALPHA_NUM.sub("", text)
+    text = _RE_DASH_NUM_ALPHA.sub("", text)
 
     # Tokenizar y filtrar stop words
     tokens = text.split()
@@ -121,8 +128,7 @@ def extract_model(normalized_title: str, brand: str | None) -> str | None:
         tokens = [t for t in tokens if t != brand]
 
     # Un modelo suele tener letras + números (ej: wh1000xm4, a2236)
-    model_pattern = re.compile(r"^(?=[a-z]*\d)[a-z0-9]{3,}$")
-    candidates = [t for t in tokens if model_pattern.match(t)]
+    candidates = [t for t in tokens if _RE_MODEL_PATTERN.match(t)]
 
     return candidates[0] if candidates else None
 

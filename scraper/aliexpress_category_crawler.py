@@ -48,6 +48,15 @@ _CATEGORY_IDS: dict[str, str] = {
     "relojes": "200362143",
     "hogar-inteligente": "200003499",
     "iluminacion-led": "200003294",
+    # New expanded categories
+    "componentes-pc": "200003071",
+    "cables-adaptadores": "200003073",
+    "baterias-cargadores": "200003490",
+    "robots-aspiradora": "200003388",
+    "seguridad-electronica": "200003500",
+    "proyectores": "200003076",
+    "fitness-tracker": "200362144",
+    "memorias-usb": "200003072",
 }
 
 

@@ -1,5 +1,6 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..database import get_db
@@ -50,6 +51,30 @@ async def scan_opportunities(db: AsyncSession = Depends(get_db)):
     """Ejecuta un escaneo de oportunidades y notifica via Telegram."""
     new_opps = await detect_opportunities(db)
 
+    # Batch-load all listing IDs needed for notifications
+    if new_opps:
+        listing_ids = set()
+        product_ids = set()
+        for opp in new_opps:
+            listing_ids.add(opp.buy_listing_id)
+            listing_ids.add(opp.sell_listing_id)
+            product_ids.add(opp.master_product_id)
+
+        # Single query: load all listings
+        listings_result = await db.execute(
+            select(ProductListing).where(ProductListing.id.in_(listing_ids))
+        )
+        listings_map = {l.id: l for l in listings_result.scalars().all()}
+
+        # Single query: load all products
+        products_result = await db.execute(
+            select(MasterProduct).where(MasterProduct.id.in_(product_ids))
+        )
+        products_map = {p.id: p for p in products_result.scalars().all()}
+    else:
+        listings_map = {}
+        products_map = {}
+
     # Notificar a usuarios con alertas configuradas
     alerts_result = await db.execute(
         select(AlertConfig).where(AlertConfig.enabled.is_(True))
@@ -58,9 +83,9 @@ async def scan_opportunities(db: AsyncSession = Depends(get_db)):
 
     notifications_sent = 0
     for opp in new_opps:
-        product = await db.get(MasterProduct, opp.master_product_id)
-        buy_listing = await db.get(ProductListing, opp.buy_listing_id)
-        sell_listing = await db.get(ProductListing, opp.sell_listing_id)
+        product = products_map.get(opp.master_product_id)
+        buy_listing = listings_map.get(opp.buy_listing_id)
+        sell_listing = listings_map.get(opp.sell_listing_id)
 
         for config in alert_configs:
             if not config.telegram_chat_id:
@@ -114,14 +139,25 @@ async def list_opportunities(
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    """Lista oportunidades con filtros opcionales."""
+    """Lista oportunidades con filtros opcionales.
+
+    Uses a single query with JOINs to fetch opportunities + buy/sell listings
+    instead of N+1 individual db.get() calls.
+    """
+    BuyListing = aliased(ProductListing)
+    SellListing = aliased(ProductListing)
+
     query = (
         select(
             Opportunity,
             MasterProduct.canonical_name,
             MasterProduct.category,
+            BuyListing,
+            SellListing,
         )
         .join(MasterProduct, Opportunity.master_product_id == MasterProduct.id)
+        .outerjoin(BuyListing, Opportunity.buy_listing_id == BuyListing.id)
+        .outerjoin(SellListing, Opportunity.sell_listing_id == SellListing.id)
         .where(Opportunity.status == status)
         .order_by(Opportunity.opportunity_score.desc())
     )
@@ -143,10 +179,7 @@ async def list_opportunities(
     rows = result.all()
 
     opportunities = []
-    for opp, product_name, _cat in rows:
-        buy_listing = await db.get(ProductListing, opp.buy_listing_id)
-        sell_listing = await db.get(ProductListing, opp.sell_listing_id)
-
+    for opp, product_name, _cat, buy_listing, sell_listing in rows:
         opportunities.append(OpportunityOut(
             id=opp.id,
             product_name=product_name,
@@ -203,18 +236,21 @@ async def list_opportunities(
 @router.get("/{opportunity_id}", response_model=OpportunityDetail)
 async def get_opportunity(opportunity_id: int, db: AsyncSession = Depends(get_db)):
     """Detalle completo de una oportunidad con listings relacionados."""
+    BuyListing = aliased(ProductListing)
+    SellListing = aliased(ProductListing)
+
     result = await db.execute(
-        select(Opportunity, MasterProduct)
+        select(Opportunity, MasterProduct, BuyListing, SellListing)
         .join(MasterProduct, Opportunity.master_product_id == MasterProduct.id)
+        .outerjoin(BuyListing, Opportunity.buy_listing_id == BuyListing.id)
+        .outerjoin(SellListing, Opportunity.sell_listing_id == SellListing.id)
         .where(Opportunity.id == opportunity_id)
     )
     row = result.first()
     if not row:
         raise HTTPException(status_code=404, detail="Opportunity not found")
 
-    opp, product = row
-    buy_listing = await db.get(ProductListing, opp.buy_listing_id)
-    sell_listing = await db.get(ProductListing, opp.sell_listing_id)
+    opp, product, buy_listing, sell_listing = row
 
     # Listings relacionados del mismo master product
     listings_result = await db.execute(
@@ -258,5 +294,3 @@ async def get_opportunity(opportunity_id: int, db: AsyncSession = Depends(get_db
         model=product.model,
         related_listings=related,
     )
-
-

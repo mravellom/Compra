@@ -1,6 +1,6 @@
 """
-Processor runner with progress bar.
-Runs the processor consumer in a subprocess and monitors Redis pending count.
+Processor runner with progress monitoring.
+Runs either the high-throughput pipeline (default) or legacy consumer.
 """
 import asyncio
 import subprocess
@@ -13,6 +13,7 @@ import redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STREAM_KEY = "raw_listings_queue"
 GROUP_NAME = "processor_group"
+PROCESSOR_MODE = os.getenv("PROCESSOR_MODE", "pipeline")
 
 
 def get_pending():
@@ -28,8 +29,6 @@ def get_pending():
                 pending = g["pending"]
                 last_delivered = g["last-delivered-id"]
                 break
-        # Messages not yet delivered to any consumer
-        # = total stream - (delivered messages count approximation)
         return stream_len, pending, last_delivered
     finally:
         r.close()
@@ -49,18 +48,31 @@ def progress_bar(current, total, width=40, extra=""):
 def main():
     stream_len, initial_pending, _ = get_pending()
 
-    # Total to process = pending + undelivered
-    # We track by watching pending decrease and new listings in DB
     total_initial = initial_pending
-    print(f"  Processor arrancando...")
+
+    # Select processor module
+    if PROCESSOR_MODE == "legacy":
+        module = "processor.consumer"
+        mode_label = "legacy (single-threaded)"
+    else:
+        module = "processor.pipeline"
+        mode_label = "pipeline (high-throughput)"
+
+    print(f"  Processor arrancando... [{mode_label}]")
     print(f"  Stream: {stream_len} mensajes | Pendientes: {initial_pending}")
     print()
 
     # Start processor as subprocess
     env = os.environ.copy()
-    env["BATCH_SIZE"] = "50"
+    if PROCESSOR_MODE != "legacy":
+        env.setdefault("BATCH_SIZE", "64")
+        env.setdefault("PREFETCH_SIZE", "512")
+        env.setdefault("NUM_WORKERS", "16")
+    else:
+        env.setdefault("BATCH_SIZE", "50")
+
     proc = subprocess.Popen(
-        [sys.executable, "-m", "processor.consumer"],
+        [sys.executable, "-m", module],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
@@ -69,15 +81,12 @@ def main():
 
     processed = 0
     start_time = time.time()
-    last_pending = initial_pending
 
     try:
         while proc.poll() is None:
             time.sleep(5)
             try:
                 stream_len, pending, _ = get_pending()
-                # Processed = how many fewer pending than initial
-                # But new messages arrive, so track delta from last check
                 processed = max(0, total_initial - pending)
 
                 elapsed = time.time() - start_time
@@ -87,16 +96,13 @@ def main():
                 extra = f"| {rate:.1f} msg/s | ~{remaining:.0f}min restantes | pendientes: {pending}"
                 progress_bar(processed, total_initial, extra=extra)
 
-                # If pending is 0 or very low, we're mostly caught up
                 if pending < 10:
                     progress_bar(total_initial, total_initial, extra="| ✓ Completado!")
                     print()
                     print(f"\n  Processor al dia. Escuchando nuevos mensajes...")
-                    # Keep running to process new incoming messages
                     proc.wait()
                     break
 
-                last_pending = pending
             except Exception as e:
                 sys.stdout.write(f"\r  [error checking progress: {e}]")
                 sys.stdout.flush()

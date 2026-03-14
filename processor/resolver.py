@@ -1,7 +1,20 @@
+"""
+Product resolver — matches incoming listings to master products.
+
+Architecture:
+  - Matching (read path): In-memory numpy index. ZERO database queries.
+    batch_resolve() computes cosine similarity for all listings in one matmul.
+  - Creation (write path): INSERT with ON CONFLICT. Only hits DB when no match found.
+  - Saving (write path): UPSERT listing + price history in one transaction.
+
+The in-memory index is loaded at startup and refreshed every 2 minutes.
+New products are appended immediately after creation.
+"""
 import hashlib
 import logging
 import os
 import statistics
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,25 +23,41 @@ from pgvector.asyncpg import register_vector  # noqa: F401
 from api.currency import FALLBACK_RATES, get_rates, to_usd, fx_convert
 
 from .db import get_pool
-from .embeddings import generate_embedding
+from .embeddings import generate_embedding, generate_embeddings_batch
 from .normalizer import extract_brand, extract_model, normalize_title, get_product_type
 from .categorizer import classify_product
+from .product_index import get_index, ProductIndex
 
 logger = logging.getLogger(__name__)
 
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.82"))
-
-# Lower threshold when brand+model match confirms identity
 BRAND_MODEL_SIMILARITY_THRESHOLD = float(os.getenv("BRAND_MODEL_THRESHOLD", "0.60"))
-
-# Lower threshold when only brand matches (same brand, similar product)
-# 0.75 allows more cross-marketplace matches while still preventing
-# clearly different products (e.g. WH-1000XM4 vs WF-1000XM4)
 BRAND_ONLY_SIMILARITY_THRESHOLD = float(os.getenv("BRAND_ONLY_THRESHOLD", "0.75"))
-
-# Maximum price ratio between a new listing and existing master product listings.
-# Prevents matching e.g. "Airpods Pro ($250)" with "Airpods case ($15)".
 MATCH_MAX_PRICE_RATIO = float(os.getenv("MATCH_MAX_PRICE_RATIO", "3.5"))
+
+# ── In-memory match cache ────────────────────────────────────
+_MATCH_CACHE_SIZE = int(os.getenv("MATCH_CACHE_SIZE", "16384"))
+_match_cache: dict[str, tuple[float, "MatchResult"]] = {}
+_MATCH_CACHE_TTL = 600  # 10 minutes
+
+
+def _cache_get(key: str) -> "MatchResult | None":
+    entry = _match_cache.get(key)
+    if entry is None:
+        return None
+    ts, result = entry
+    if time.monotonic() - ts > _MATCH_CACHE_TTL:
+        del _match_cache[key]
+        return None
+    return result
+
+
+def _cache_put(key: str, result: "MatchResult") -> None:
+    if len(_match_cache) >= _MATCH_CACHE_SIZE:
+        sorted_keys = sorted(_match_cache, key=lambda k: _match_cache[k][0])
+        for k in sorted_keys[: _MATCH_CACHE_SIZE // 4]:
+            del _match_cache[k]
+    _match_cache[key] = (time.monotonic(), result)
 
 
 @dataclass
@@ -39,88 +68,41 @@ class MatchResult:
     is_new: bool
 
 
-async def _match_by_brand_model(conn, brand: str, model: str, embedding) -> dict | None:
-    """Try exact brand+model match, verify with embedding similarity."""
-    if not brand or not model:
-        return None
+# ── Metrics ──────────────────────────────────────────────────
+@dataclass
+class ResolverMetrics:
+    """Detailed metrics for the resolver layer."""
+    cache_hits: int = 0
+    index_lookups: int = 0
+    index_matches: int = 0
+    db_creates: int = 0
+    db_create_conflicts: int = 0
+    total_resolve_time: float = 0.0
+    total_save_time: float = 0.0
+    total_queries: int = 0
+    pool_wait_time: float = 0.0
 
-    row = await conn.fetchrow(
-        """
-        SELECT id, canonical_name,
-               1 - (embedding <=> $1::vector) AS similarity
-        FROM master_products
-        WHERE brand = $2 AND model = $3
-        ORDER BY embedding <=> $1::vector
-        LIMIT 1
-        """,
-        np.array(embedding), brand, model,
-    )
-
-    if row and row["similarity"] >= BRAND_MODEL_SIMILARITY_THRESHOLD:
-        return dict(row)
-    return None
-
-
-async def _match_by_brand_embedding(conn, brand: str, model: str | None, embedding) -> dict | None:
-    """Match within same brand using a relaxed embedding threshold.
-
-    Excludes candidates that have a different model to avoid false merges
-    (e.g. Garmin Edge 530 != Garmin Edge 840).
-    """
-    if not brand:
-        return None
-
-    if model:
-        # If we have a model, exclude products with a different model
-        row = await conn.fetchrow(
-            """
-            SELECT id, canonical_name,
-                   1 - (embedding <=> $1::vector) AS similarity
-            FROM master_products
-            WHERE brand = $2 AND (model IS NULL OR model = $3)
-            ORDER BY embedding <=> $1::vector
-            LIMIT 1
-            """,
-            np.array(embedding), brand, model,
-        )
-    else:
-        row = await conn.fetchrow(
-            """
-            SELECT id, canonical_name,
-                   1 - (embedding <=> $1::vector) AS similarity
-            FROM master_products
-            WHERE brand = $2
-            ORDER BY embedding <=> $1::vector
-            LIMIT 1
-            """,
-            np.array(embedding), brand,
+    def log(self):
+        total = self.cache_hits + self.index_lookups
+        hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
+        avg_resolve = (self.total_resolve_time / total * 1000) if total > 0 else 0
+        avg_save = (self.total_save_time / self.total_queries * 1000) if self.total_queries > 0 else 0
+        logger.info(
+            "RESOLVER | cache_hit_rate=%.1f%% | index_lookups=%d | index_matches=%d | "
+            "db_creates=%d | conflicts=%d | avg_resolve=%.2fms | avg_save=%.2fms | "
+            "pool_wait=%.1fms",
+            hit_rate, self.index_lookups, self.index_matches,
+            self.db_creates, self.db_create_conflicts,
+            avg_resolve, avg_save, self.pool_wait_time * 1000,
         )
 
-    if row and row["similarity"] >= BRAND_ONLY_SIMILARITY_THRESHOLD:
-        return dict(row)
-    return None
+
+resolver_metrics = ResolverMetrics()
 
 
-async def _match_by_embedding(conn, embedding) -> dict | None:
-    """Global embedding match with strict threshold."""
-    row = await conn.fetchrow(
-        """
-        SELECT id, canonical_name,
-               1 - (embedding <=> $1::vector) AS similarity
-        FROM master_products
-        ORDER BY embedding <=> $1::vector
-        LIMIT 1
-        """,
-        np.array(embedding),
-    )
-
-    if row and row["similarity"] >= SIMILARITY_THRESHOLD:
-        return dict(row)
-    return None
-
+# ── FX rates ─────────────────────────────────────────────────
 
 async def _get_fx_rates() -> dict[str, float]:
-    """Fetch live FX rates, falling back to hardcoded rates on failure."""
     try:
         return await get_rates()
     except Exception:
@@ -128,151 +110,284 @@ async def _get_fx_rates() -> dict[str, float]:
         return FALLBACK_RATES
 
 
-async def _price_compatible(conn, master_product_id: int, new_price: float, new_currency: str) -> bool:
-    """Reject match if price ratio vs existing listings median is too high.
+# ── Batch resolve (the main entry point for the pipeline) ────
 
-    Prevents grouping e.g. 'Airpods Pro ($250)' with 'Airpods case ($15)'.
-    Converts all prices to USD using live FX rates for cross-currency comparison.
+async def batch_resolve(
+    titles: list[str],
+    embeddings: list[list[float]],
+    prices: list[float],
+    currencies: list[str],
+) -> list[MatchResult]:
+    """Resolve a batch of listings using the in-memory product index.
+
+    This is the primary entry point for the pipeline. It:
+    1. Checks the match cache for each listing
+    2. For cache misses, uses the in-memory index (single numpy matmul)
+    3. For unmatched listings, creates new products in DB
+
+    Returns a MatchResult for each listing in the same order.
+
+    Cost: O(1) cache hits + O(M*N) numpy matmul (M queries, N products)
+          + O(K) DB inserts for K new products. Typically K << M.
     """
-    if new_price <= 0:
-        return True
-
-    rows = await conn.fetch(
-        "SELECT price::float, currency FROM product_listings WHERE master_product_id = $1",
-        master_product_id,
-    )
-    if not rows:
-        return True
-
+    t0 = time.monotonic()
+    index = get_index()
     rates = await _get_fx_rates()
 
-    existing_usd = [to_usd(r["price"], r["currency"], rates) for r in rows]
-    new_usd = to_usd(new_price, new_currency, rates)
+    M = len(titles)
+    results: list[MatchResult | None] = [None] * M
 
-    median_usd = statistics.median(existing_usd)
-    if median_usd <= 0:
-        return True
+    # ── Step 1: Check cache ──────────────────────────────
+    uncached_indices: list[int] = []
+    for i in range(M):
+        normalized = normalize_title(titles[i])
+        cache_key = f"{normalized}:{prices[i]:.2f}:{currencies[i]}"
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            results[i] = cached
+            resolver_metrics.cache_hits += 1
+        else:
+            uncached_indices.append(i)
 
-    ratio = max(new_usd, median_usd) / min(new_usd, median_usd)
-    if ratio > MATCH_MAX_PRICE_RATIO:
-        logger.info(
-            "REJECTED match (price ratio %.1fx): new $%.2f %s (~$%.2f USD) vs median ~$%.2f USD for master_product %d",
-            ratio, new_price, new_currency, new_usd, median_usd, master_product_id,
+    if not uncached_indices:
+        resolver_metrics.total_resolve_time += time.monotonic() - t0
+        return results  # type: ignore  # all filled from cache
+
+    # ── Step 2: In-memory index search ───────────────────
+    # Prepare batch data for uncached queries
+    query_embeddings = np.array(
+        [embeddings[i] for i in uncached_indices], dtype=np.float32
+    )
+    query_brands = []
+    query_models = []
+    query_prices_usd = []
+    query_types = []
+    query_normalized = []
+
+    for i in uncached_indices:
+        normalized = normalize_title(titles[i])
+        brand = extract_brand(normalized)
+        model = extract_model(normalized, brand)
+        query_normalized.append(normalized)
+        query_brands.append(brand)
+        query_models.append(model)
+        query_prices_usd.append(to_usd(prices[i], currencies[i], rates))
+        query_types.append(get_product_type(normalized))
+
+    resolver_metrics.index_lookups += len(uncached_indices)
+
+    if index.is_loaded and index.size > 0:
+        search_results = index.batch_search(
+            query_embeddings,
+            query_brands,
+            query_models,
+            query_prices_usd,
+            query_types,
+            brand_model_threshold=BRAND_MODEL_SIMILARITY_THRESHOLD,
+            brand_only_threshold=BRAND_ONLY_SIMILARITY_THRESHOLD,
+            global_threshold=SIMILARITY_THRESHOLD,
+            max_price_ratio=MATCH_MAX_PRICE_RATIO,
         )
-        return False
-    return True
+    else:
+        search_results = [None] * len(uncached_indices)
+
+    # ── Step 3: Process results ──────────────────────────
+    new_product_tasks: list[tuple[int, int, str, str | None, str | None, list[float], float, str]] = []
+    # (batch_position, uncached_position, normalized, brand, model, embedding, price, currency)
+
+    for j, ui in enumerate(uncached_indices):
+        match = search_results[j]
+        if match is not None:
+            resolver_metrics.index_matches += 1
+            result = MatchResult(
+                master_product_id=match.product.id,
+                canonical_name=match.product.canonical_name,
+                similarity=match.similarity,
+                is_new=False,
+            )
+            results[ui] = result
+            cache_key = f"{query_normalized[j]}:{prices[ui]:.2f}:{currencies[ui]}"
+            _cache_put(cache_key, result)
+        else:
+            # No match — need to create a new product in DB
+            new_product_tasks.append((
+                ui, j, query_normalized[j], query_brands[j], query_models[j],
+                embeddings[ui], prices[ui], currencies[ui],
+            ))
+
+    # ── Step 4: Create new products (batch DB write) ────
+    if new_product_tasks:
+        t_db = time.monotonic()
+        pool = await get_pool()
+
+        # Prepare batch arrays, deduplicating by canonical_name within batch
+        batch_names = []
+        batch_brands = []
+        batch_models = []
+        batch_categories = []
+        batch_embeddings = []
+        task_map = []  # (ui, j, normalized, brand, model, embedding, price, currency, category)
+        seen_names: set[str] = set()
+        deferred_dupes = []  # tasks that share a canonical_name with another in this batch
+
+        for ui, j, normalized, brand, model, embedding, price, currency in new_product_tasks:
+            category = classify_product(normalized)
+            if normalized not in seen_names:
+                seen_names.add(normalized)
+                batch_names.append(normalized)
+                batch_brands.append(brand)
+                batch_models.append(model)
+                batch_categories.append(category)
+                batch_embeddings.append(np.array(embedding, dtype=np.float32))
+                task_map.append((ui, j, normalized, brand, model, embedding, price, currency, category))
+            else:
+                # Will resolve after the batch insert using row_map
+                deferred_dupes.append((ui, j, normalized, brand, model, embedding, price, currency, category))
+
+        try:
+            async with pool.acquire() as conn:
+                # Batch insert all new products at once
+                rows = await conn.fetch(
+                    """
+                    INSERT INTO master_products (canonical_name, brand, model, category, embedding)
+                    SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::vector[])
+                    ON CONFLICT (canonical_name) DO UPDATE SET updated_at = now()
+                    RETURNING id, canonical_name, (xmax = 0) AS was_inserted
+                    """,
+                    batch_names, batch_brands, batch_models, batch_categories, batch_embeddings,
+                )
+
+            # Build lookup by canonical_name
+            row_map = {r["canonical_name"]: r for r in rows}
+
+            new_ids = []
+            new_names = []
+            new_brands = []
+            new_models = []
+            new_categories = []
+            new_embeddings = []
+
+            for ui, j, normalized, brand, model, embedding, price, currency, category in task_map:
+                row = row_map.get(normalized)
+                if row is None:
+                    continue
+
+                new_id = row["id"]
+                was_inserted = row["was_inserted"]
+
+                if was_inserted:
+                    resolver_metrics.db_creates += 1
+                    new_ids.append(new_id)
+                    new_names.append(normalized)
+                    new_brands.append(brand)
+                    new_models.append(model)
+                    new_categories.append(category)
+                    new_embeddings.append(embedding)
+                else:
+                    resolver_metrics.db_create_conflicts += 1
+
+                result = MatchResult(
+                    master_product_id=new_id,
+                    canonical_name=normalized,
+                    similarity=1.0,
+                    is_new=was_inserted,
+                )
+                results[ui] = result
+                cache_key = f"{normalized}:{price:.2f}:{currency}"
+                _cache_put(cache_key, result)
+
+            # Resolve deferred duplicates (same canonical_name within batch)
+            for ui, j, normalized, brand, model, embedding, price, currency, category in deferred_dupes:
+                row = row_map.get(normalized)
+                if row is None:
+                    continue
+                result = MatchResult(
+                    master_product_id=row["id"],
+                    canonical_name=normalized,
+                    similarity=1.0,
+                    is_new=False,
+                )
+                results[ui] = result
+                cache_key = f"{normalized}:{price:.2f}:{currency}"
+                _cache_put(cache_key, result)
+
+            # Batch append to in-memory index
+            if new_ids:
+                index.append_batch(new_ids, new_names, new_brands, new_models,
+                                   new_categories, new_embeddings)
+                logger.info("NEW PRODUCTS: %d created in batch", len(new_ids))
+
+        except Exception:
+            logger.error("Batch product creation failed, falling back to individual", exc_info=True)
+            for ui, j, normalized, brand, model, embedding, price, currency, category in task_map:
+                try:
+                    async with pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO master_products (canonical_name, brand, model, category, embedding)
+                            VALUES ($1, $2, $3, $4, $5::vector)
+                            ON CONFLICT (canonical_name) DO UPDATE SET updated_at = now()
+                            RETURNING id, (xmax = 0) AS was_inserted
+                            """,
+                            normalized, brand, model, category, np.array(embedding),
+                        )
+                    new_id = row["id"]
+                    was_inserted = row["was_inserted"]
+                    if was_inserted:
+                        resolver_metrics.db_creates += 1
+                        index.append(new_id, normalized, brand, model, category, embedding)
+                    else:
+                        resolver_metrics.db_create_conflicts += 1
+                    results[ui] = MatchResult(
+                        master_product_id=new_id, canonical_name=normalized,
+                        similarity=1.0, is_new=was_inserted,
+                    )
+                    cache_key = f"{normalized}:{price:.2f}:{currency}"
+                    _cache_put(cache_key, result)
+                except Exception:
+                    logger.error("Error creating product '%s'", normalized[:50], exc_info=True)
+
+        resolver_metrics.pool_wait_time += time.monotonic() - t_db
+
+    resolver_metrics.total_resolve_time += time.monotonic() - t0
+
+    # Fill any remaining None results (shouldn't happen, but safety)
+    for i in range(M):
+        if results[i] is None:
+            logger.error("Unresolved listing at index %d: '%s'", i, titles[i][:50])
+            # Create a dummy result to avoid pipeline crash
+            results[i] = MatchResult(
+                master_product_id=-1,
+                canonical_name="__unresolved__",
+                similarity=0.0,
+                is_new=False,
+            )
+
+    return results  # type: ignore
 
 
-def _product_type_compatible(new_title: str, existing_canonical: str) -> bool:
-    """Prevent mixing accessories with main products."""
-    new_type = get_product_type(new_title)
-    existing_type = get_product_type(existing_canonical)
-    if new_type != existing_type:
-        logger.debug(
-            "Product type mismatch: '%s' (%s) vs '%s' (%s)",
-            new_title[:50], new_type, existing_canonical[:50], existing_type,
-        )
-        return False
-    return True
-
+# ── Legacy single-item resolve (for consumer.py backward compat) ──
 
 async def resolve_product(raw_title: str, price: float = 0.0, currency: str = "USD") -> MatchResult:
-    """
-    Multi-level product resolution:
-    1. Exact brand+model match (threshold 0.65) — catches cross-marketplace same product
-    2. Same brand + embedding (threshold 0.80) — catches variants with different descriptions
-    3. Global embedding (threshold 0.88) — original strict matching
-    4. No match -> create new master product
-
-    Guards:
-    - Accessory vs main product type must match.
-    - Price ratio check: rejects matches where new listing price differs >3x
-      from median price of existing listings (prevents Airpods Pro ↔ Airpods case).
-    """
+    """Single-item resolve (legacy path for consumer.py)."""
     normalized = normalize_title(raw_title)
-    brand = extract_brand(normalized)
-    model = extract_model(normalized, brand)
     embedding = generate_embedding(normalized)
+    results = await batch_resolve([raw_title], [embedding], [price], [currency])
+    return results[0]
 
-    pool = await get_pool()
 
-    async with pool.acquire() as conn:
-        # Use a transaction with advisory lock to prevent race conditions
-        # creating duplicate master_products for the same normalized title
-        async with conn.transaction():
-            # Use SHA-256 for a deterministic hash across processes.
-            # Python's hash() uses a random seed per process (PYTHONHASHSEED),
-            # so two consumers would get different locks for the same title.
-            title_hash = int(hashlib.sha256(normalized.encode()).hexdigest()[:15], 16) % (2**31 - 1)
-            await conn.execute("SELECT pg_advisory_xact_lock($1)", title_hash)
+async def resolve_product_with_embedding(
+    raw_title: str,
+    embedding: list[float],
+    price: float = 0.0,
+    currency: str = "USD",
+) -> MatchResult:
+    """Single-item resolve with pre-computed embedding (legacy path)."""
+    results = await batch_resolve([raw_title], [embedding], [price], [currency])
+    return results[0]
 
-            # Level 1: Exact brand + model match
-            match = await _match_by_brand_model(conn, brand, model, embedding)
-            if (match
-                    and _product_type_compatible(normalized, match["canonical_name"])
-                    and await _price_compatible(conn, match["id"], price, currency)):
-                logger.info(
-                    "MATCH [brand+model]: '%s' -> '%s' (sim=%.3f)",
-                    normalized, match["canonical_name"], match["similarity"],
-                )
-                return MatchResult(
-                    master_product_id=match["id"],
-                    canonical_name=match["canonical_name"],
-                    similarity=match["similarity"],
-                    is_new=False,
-                )
 
-            # Level 2: Same brand, relaxed embedding threshold
-            match = await _match_by_brand_embedding(conn, brand, model, embedding)
-            if (match
-                    and _product_type_compatible(normalized, match["canonical_name"])
-                    and await _price_compatible(conn, match["id"], price, currency)):
-                logger.info(
-                    "MATCH [brand+emb]: '%s' -> '%s' (sim=%.3f)",
-                    normalized, match["canonical_name"], match["similarity"],
-                )
-                return MatchResult(
-                    master_product_id=match["id"],
-                    canonical_name=match["canonical_name"],
-                    similarity=match["similarity"],
-                    is_new=False,
-                )
-
-            # Level 3: Global embedding match (strict)
-            match = await _match_by_embedding(conn, embedding)
-            if (match
-                    and _product_type_compatible(normalized, match["canonical_name"])
-                    and await _price_compatible(conn, match["id"], price, currency)):
-                logger.info(
-                    "MATCH [embedding]: '%s' -> '%s' (sim=%.3f)",
-                    normalized, match["canonical_name"], match["similarity"],
-                )
-                return MatchResult(
-                    master_product_id=match["id"],
-                    canonical_name=match["canonical_name"],
-                    similarity=match["similarity"],
-                    is_new=False,
-                )
-
-            # No match -> create new master product
-            category = classify_product(normalized)
-            new_id = await conn.fetchval(
-                """
-                INSERT INTO master_products (canonical_name, brand, model, category, embedding)
-                VALUES ($1, $2, $3, $4, $5::vector)
-                RETURNING id
-                """,
-                normalized, brand, model, category, np.array(embedding),
-            )
-
-            logger.info("NEW PRODUCT: '%s' (id=%d, brand=%s, model=%s, cat=%s)", normalized, new_id, brand, model, category)
-            return MatchResult(
-                master_product_id=new_id,
-                canonical_name=normalized,
-                similarity=1.0,
-                is_new=True,
-            )
-
+# ── Save listing (single transaction) ────────────────────────
 
 async def save_listing(
     master_product_id: int,
@@ -294,43 +409,96 @@ async def save_listing(
     is_free_shipping: bool = False,
     shipping_price: float | None = None,
 ) -> int:
-    """Guarda el listing vinculado al master product y registra precio en historial."""
+    """Save listing + price history + update median in a single transaction."""
+    t0 = time.monotonic()
+    rates = await _get_fx_rates()
+    new_usd = to_usd(price, currency, rates)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # UPSERT: insert new listing or update existing by URL
-        listing_id = await conn.fetchval(
-            """
-            INSERT INTO product_listings
-                (master_product_id, title, normalized_title, price, currency,
-                 url, marketplace_id, image_url, similarity_score, scraped_at,
-                 condition, seller_name, seller_rating, reviews_count, sales_count,
-                 stock_available, is_free_shipping, shipping_price)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz,
-                    $11, $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT (url) DO UPDATE SET
-                price          = EXCLUDED.price,
-                seller_rating  = EXCLUDED.seller_rating,
-                scraped_at     = EXCLUDED.scraped_at,
-                reviews_count  = EXCLUDED.reviews_count,
-                sales_count    = EXCLUDED.sales_count,
-                stock_available = EXCLUDED.stock_available,
-                is_free_shipping = EXCLUDED.is_free_shipping,
-                shipping_price = EXCLUDED.shipping_price
-            RETURNING id
-            """,
-            master_product_id, title, normalized_title, price, currency,
-            url, marketplace_id, image_url, similarity, scraped_at,
-            condition, seller_name, seller_rating, reviews_count, sales_count,
-            stock_available, is_free_shipping, shipping_price,
-        )
+        async with conn.transaction():
+            listing_id = await conn.fetchval(
+                """
+                INSERT INTO product_listings
+                    (master_product_id, title, normalized_title, price, currency,
+                     url, marketplace_id, image_url, similarity_score, scraped_at,
+                     condition, seller_name, seller_rating, reviews_count, sales_count,
+                     stock_available, is_free_shipping, shipping_price)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz,
+                        $11, $12, $13, $14, $15, $16, $17, $18)
+                ON CONFLICT (url) DO UPDATE SET
+                    price          = EXCLUDED.price,
+                    seller_rating  = EXCLUDED.seller_rating,
+                    scraped_at     = EXCLUDED.scraped_at,
+                    reviews_count  = EXCLUDED.reviews_count,
+                    sales_count    = EXCLUDED.sales_count,
+                    stock_available = EXCLUDED.stock_available,
+                    is_free_shipping = EXCLUDED.is_free_shipping,
+                    shipping_price = EXCLUDED.shipping_price
+                RETURNING id
+                """,
+                master_product_id, title, normalized_title, price, currency,
+                url, marketplace_id, image_url, similarity, scraped_at,
+                condition, seller_name, seller_rating, reviews_count, sales_count,
+                stock_available, is_free_shipping, shipping_price,
+            )
 
-        # Record price history
-        await conn.execute(
-            """
-            INSERT INTO price_history (listing_url, marketplace_id, price, currency)
-            VALUES ($1, $2, $3, $4)
-            """,
-            url, marketplace_id, price, currency,
-        )
+            await conn.execute(
+                """
+                WITH ph AS (
+                    INSERT INTO price_history (listing_url, marketplace_id, price, currency)
+                    VALUES ($1, $2, $3, $4)
+                )
+                UPDATE master_products
+                SET listing_price_count = COALESCE(listing_price_count, 0) + 1,
+                    median_price_usd = CASE
+                        WHEN COALESCE(listing_price_count, 0) = 0 THEN $5
+                        WHEN $5 > COALESCE(median_price_usd, 0)
+                            THEN COALESCE(median_price_usd, 0) + (($5 - COALESCE(median_price_usd, 0)) / (COALESCE(listing_price_count, 0) + 1))
+                        WHEN $5 < COALESCE(median_price_usd, 0)
+                            THEN COALESCE(median_price_usd, 0) - ((COALESCE(median_price_usd, 0) - $5) / (COALESCE(listing_price_count, 0) + 1))
+                        ELSE COALESCE(median_price_usd, 0)
+                    END
+                WHERE id = $6
+                """,
+                url, marketplace_id, price, currency,
+                new_usd, master_product_id,
+            )
 
+        resolver_metrics.total_save_time += time.monotonic() - t0
+        resolver_metrics.total_queries += 1
         return listing_id
+
+
+# ── Batch median recalculation ───────────────────────────────
+
+async def recalculate_medians() -> int:
+    """Recalculate true median_price_usd for all master products."""
+    pool = await get_pool()
+    rates = await _get_fx_rates()
+    count = 0
+
+    async with pool.acquire() as conn:
+        product_ids = await conn.fetch(
+            "SELECT id FROM master_products WHERE listing_price_count > 0"
+        )
+        for row in product_ids:
+            pid = row["id"]
+            listings = await conn.fetch(
+                "SELECT price::float, currency FROM product_listings WHERE master_product_id = $1",
+                pid,
+            )
+            if not listings:
+                continue
+
+            usd_prices = [to_usd(r["price"], r["currency"], rates) for r in listings]
+            median = statistics.median(usd_prices)
+
+            await conn.execute(
+                "UPDATE master_products SET median_price_usd = $1, listing_price_count = $2 WHERE id = $3",
+                median, len(listings), pid,
+            )
+            count += 1
+
+    logger.info("Recalculated medians for %d products", count)
+    return count

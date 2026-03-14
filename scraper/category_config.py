@@ -45,6 +45,17 @@ ML_CATEGORIES_AR: dict[str, str] = {
     # Watches & Smart Home
     "relojes": "https://listado.mercadolibre.com.ar/relojes-joyas/relojes-pulsera/",
     "hogar-inteligente": "https://listado.mercadolibre.com.ar/electronica-audio-video/controles-remoto-accesorios/",
+    # New expanded categories
+    "componentes-pc": "https://listado.mercadolibre.com.ar/computacion/componentes-pc/",
+    "proyectores": "https://listado.mercadolibre.com.ar/electronica-audio-video/proyectores-accesorios/",
+    "ups-reguladores": "https://listado.mercadolibre.com.ar/computacion/estabilizadores-ups/",
+    "seguridad-electronica": "https://listado.mercadolibre.com.ar/electronica-audio-video/seguridad-electronica/",
+    "audio-vehicular": "https://listado.mercadolibre.com.ar/electronica-audio-video/audio-vehiculos/",
+    "fitness-tracker": "https://listado.mercadolibre.com.ar/celulares-telefonos/smartwatches-accesorios/",
+    "memorias-usb": "https://listado.mercadolibre.com.ar/computacion/almacenamiento/pendrives-memorias-usb/",
+    "cables-adaptadores": "https://listado.mercadolibre.com.ar/computacion/cables-conectores/",
+    "baterias-cargadores": "https://listado.mercadolibre.com.ar/celulares-telefonos/cargadores-cables/",
+    "robots-aspiradora": "https://listado.mercadolibre.com.ar/electrodomesticos/aspiradoras-limpieza/robots-aspiradoras/",
 }
 
 # ── MercadoLibre MX ──────────────────────────────────────────
@@ -76,6 +87,16 @@ ML_CATEGORIES_MX: dict[str, str] = {
     "electronica-vehicular": "https://listado.mercadolibre.com.mx/electronica-audio-video/audio-vehiculos/",
     "relojes": "https://listado.mercadolibre.com.mx/relojes-joyas/relojes-pulsera/",
     "hogar-inteligente": "https://listado.mercadolibre.com.mx/electronica-audio-video/controles-remoto-accesorios/",
+    # New expanded categories
+    "componentes-pc": "https://listado.mercadolibre.com.mx/computacion/componentes-pc/",
+    "proyectores": "https://listado.mercadolibre.com.mx/electronica-audio-video/proyectores-accesorios/",
+    "ups-reguladores": "https://listado.mercadolibre.com.mx/computacion/estabilizadores-ups/",
+    "seguridad-electronica": "https://listado.mercadolibre.com.mx/electronica-audio-video/seguridad-electronica/",
+    "audio-vehicular": "https://listado.mercadolibre.com.mx/electronica-audio-video/audio-vehiculos/",
+    "memorias-usb": "https://listado.mercadolibre.com.mx/computacion/almacenamiento/pendrives-memorias-usb/",
+    "cables-adaptadores": "https://listado.mercadolibre.com.mx/computacion/cables-conectores/",
+    "baterias-cargadores": "https://listado.mercadolibre.com.mx/celulares-telefonos/cargadores-cables/",
+    "robots-aspiradora": "https://listado.mercadolibre.com.mx/electrodomesticos/aspiradoras-limpieza/robots-aspiradoras/",
 }
 
 # ── MercadoLibre CL ──────────────────────────────────────────
@@ -94,6 +115,10 @@ ML_CATEGORIES_CL: dict[str, str] = {
     "herramientas-electricas": "https://listado.mercadolibre.cl/herramientas/herramientas-electricas/",
     "electrodomesticos": "https://listado.mercadolibre.cl/electrodomesticos/pequenos/",
     "relojes": "https://listado.mercadolibre.cl/relojes-joyas/relojes-pulsera/",
+    # New expanded categories
+    "componentes-pc": "https://listado.mercadolibre.cl/computacion/componentes-pc/",
+    "cables-adaptadores": "https://listado.mercadolibre.cl/computacion/cables-conectores/",
+    "baterias-cargadores": "https://listado.mercadolibre.cl/celulares-telefonos/cargadores-cables/",
 }
 
 # ── MercadoLibre CO ──────────────────────────────────────────
@@ -112,6 +137,10 @@ ML_CATEGORIES_CO: dict[str, str] = {
     "herramientas-electricas": "https://listado.mercadolibre.com.co/herramientas/herramientas-electricas/",
     "electrodomesticos": "https://listado.mercadolibre.com.co/electrodomesticos/pequenos/",
     "relojes": "https://listado.mercadolibre.com.co/relojes-joyas/relojes-pulsera/",
+    # New expanded categories
+    "componentes-pc": "https://listado.mercadolibre.com.co/computacion/componentes-pc/",
+    "cables-adaptadores": "https://listado.mercadolibre.com.co/computacion/cables-conectores/",
+    "baterias-cargadores": "https://listado.mercadolibre.com.co/celulares-telefonos/cargadores-cables/",
 }
 
 # ── Amazon MX browse nodes ───────────────────────────────────
@@ -133,6 +162,14 @@ AMAZON_MX_CATEGORIES: dict[str, str] = {
     "electrodomesticos": "https://www.amazon.com.mx/s?rh=n%3A9482494011&fs=true",
     "relojes": "https://www.amazon.com.mx/s?rh=n%3A9482644011&fs=true",
     "smartwatch": "https://www.amazon.com.mx/s?rh=n%3A16333826011&fs=true",
+    # New expanded categories
+    "componentes-pc": "https://www.amazon.com.mx/s?rh=n%3A9482500011&fs=true",
+    "cables-adaptadores": "https://www.amazon.com.mx/s?rh=n%3A9482524011&fs=true&s=popularity-rank",
+    "baterias-cargadores": "https://www.amazon.com.mx/s?rh=n%3A9482632011&fs=true&s=popularity-rank",
+    "robots-aspiradora": "https://www.amazon.com.mx/s?rh=n%3A16333858011&fs=true",
+    "parlantes": "https://www.amazon.com.mx/s?rh=n%3A9482564011&fs=true",
+    "drones": "https://www.amazon.com.mx/s?rh=n%3A16333788011&fs=true",
+    "hogar-inteligente": "https://www.amazon.com.mx/s?rh=n%3A16333812011&fs=true",
 }
 
 # ── Amazon US browse nodes ───────────────────────────────────
@@ -156,6 +193,13 @@ AMAZON_US_CATEGORIES: dict[str, str] = {
     "electrodomesticos": "https://www.amazon.com/s?rh=n%3A1055398&fs=true",
     "relojes": "https://www.amazon.com/s?rh=n%3A6358539011&fs=true",
     "hogar-inteligente": "https://www.amazon.com/s?rh=n%3A6563140011&fs=true",
+    # New expanded categories
+    "componentes-pc": "https://www.amazon.com/s?rh=n%3A193870011&fs=true",
+    "cables-adaptadores": "https://www.amazon.com/s?rh=n%3A464394&fs=true",
+    "baterias-cargadores": "https://www.amazon.com/s?rh=n%3A10112773011&fs=true",
+    "robots-aspiradora": "https://www.amazon.com/s?rh=n%3A3743561&fs=true",
+    "seguridad-electronica": "https://www.amazon.com/s?rh=n%3A7icons161092011&fs=true",
+    "proyectores": "https://www.amazon.com/s?rh=n%3A300334&fs=true",
 }
 
 # ── AliExpress categories ────────────────────────────────────
@@ -179,6 +223,15 @@ ALIEXPRESS_CATEGORIES: dict[str, str] = {
     "relojes": "https://www.aliexpress.com/category/200362143/watches.html",
     "hogar-inteligente": "https://www.aliexpress.com/category/200003499/smart-home.html",
     "iluminacion-led": "https://www.aliexpress.com/category/200003294/led-lighting.html",
+    # New expanded categories
+    "componentes-pc": "https://www.aliexpress.com/category/200003071/computer-components.html",
+    "cables-adaptadores": "https://www.aliexpress.com/category/200003073/cables-adapters.html",
+    "baterias-cargadores": "https://www.aliexpress.com/category/200003490/chargers.html",
+    "robots-aspiradora": "https://www.aliexpress.com/category/200003388/vacuum-cleaners.html",
+    "seguridad-electronica": "https://www.aliexpress.com/category/200003500/security-protection.html",
+    "proyectores": "https://www.aliexpress.com/category/200003076/projectors.html",
+    "fitness-tracker": "https://www.aliexpress.com/category/200362144/smart-watches.html",
+    "memorias-usb": "https://www.aliexpress.com/category/200003072/usb-flash-drives.html",
 }
 
 # ── Master mapping ───────────────────────────────────────────
@@ -194,12 +247,15 @@ CATEGORY_MAPS: dict[str, dict[str, str]] = {
 
 # ── Default category list (used when CATEGORIES env var is empty) ──
 DEFAULT_CATEGORIES: list[str] = [
+    # Audio
     "audifonos",
     "parlantes",
     "audio-profesional",
+    # Phones & Wearables
     "celulares",
     "accesorios-celulares",
     "smartwatch",
+    # Computing
     "notebooks",
     "tablets",
     "monitores",
@@ -207,25 +263,42 @@ DEFAULT_CATEGORIES: list[str] = [
     "perifericos",
     "networking",
     "impresoras",
+    # Gaming
     "consolas",
     "accesorios-gaming",
     "juegos-fisicos",
+    # Cameras
     "camaras-digitales",
     "accesorios-camaras",
     "drones",
+    # Tools & Industrial
     "herramientas-electricas",
     "instrumentos-medicion",
+    # Home & Appliances
     "electrodomesticos",
     "climatizacion",
+    # Automotive
     "accesorios-vehiculos",
     "electronica-vehicular",
+    # Watches & Smart Home
     "relojes",
     "hogar-inteligente",
     "iluminacion-led",
+    # ── New categories for expanded coverage ──
+    "componentes-pc",
+    "proyectores",
+    "ups-reguladores",
+    "seguridad-electronica",
+    "audio-vehicular",
+    "fitness-tracker",
+    "memorias-usb",
+    "cables-adaptadores",
+    "baterias-cargadores",
+    "robots-aspiradora",
 ]
 
-# ── Max pages per category (can be overridden by smart expansion) ──
-DEFAULT_MAX_PAGES = 10
+# ── Max pages per category (can be overridden by smart expansion / prioritizer) ──
+DEFAULT_MAX_PAGES = 15
 
 
 def get_category_url(marketplace_id: str, category_slug: str) -> str | None:
