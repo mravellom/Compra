@@ -57,6 +57,90 @@ from .scoring import ScoringInput, score as score_opportunity_v2
 
 logger = logging.getLogger(__name__)
 
+
+import re as _re
+
+# Model number patterns — capture identifiers that distinguish product versions
+_MODEL_PATTERNS = [
+    # Phone models: iPhone 17e, iPhone 17 Pro, iPhone 15 Pro Max, Galaxy S25 Ultra
+    _re.compile(r'(iphone\s*\d+\s*(?:pro\s*max|pro|plus|e|mini)?)', _re.I),
+    _re.compile(r'(galaxy\s*(?:s|a|z|tab|watch|buds)\s*\d+\s*(?:ultra|plus|fe|pro|lite|fold|flip)?(?:\s*\d+)?)', _re.I),
+    _re.compile(r'(pixel\s*\d+\s*(?:pro\s*xl|pro\s*fold|pro|a)?)', _re.I),
+    _re.compile(r'(redmi\s*(?:note\s*)?\d+\s*(?:pro\s*max|pro\s*plus|pro|s|c|a)?)', _re.I),
+    _re.compile(r'(poco\s*(?:m|x|f|c|pad)\s*\d*\s*(?:pro|gt)?)', _re.I),
+    # Watch models: Watch SE, Watch Series 7, Watch Series 10, Watch Ultra
+    _re.compile(r'(watch\s*(?:series\s*\d+|ultra\s*\d*|se\s*\d*)\b)', _re.I),
+    # Headphone models: Freebuds SE 2, Freebuds 7i, AirPods Pro, WH-1000XM5
+    _re.compile(r'(freebuds\s*\w+\s*\d*)', _re.I),
+    _re.compile(r'(airpods\s*(?:pro|max)?\s*\d*)', _re.I),
+    _re.compile(r'([a-z]{2,3}-?\d{3,4}[a-z]*\d*)', _re.I),  # WH-1000XM5, XM4, etc.
+    # RAM: DDR4 vs DDR5 + capacity (e.g. "ddr5 16gb", "ddr4 8gb")
+    _re.compile(r'(ddr\d\s*\d+\s*gb)', _re.I),
+    # GoPro models
+    _re.compile(r'(gopro\s*hero\s*\d*\s*(?:black|silver|white|lit)?)', _re.I),
+    # Gaming peripherals with version: Blackwidow V3, V4 Pro, V4 75%, Kraken V4, etc.
+    _re.compile(r'((?:blackwidow|kraken|deathadder|viper|huntsman|basilisk|ornata)\s*v\d+\s*(?:pro|lite|mini|te|75%|tkl)?)', _re.I),
+    # Laptop models
+    _re.compile(r'((?:tuf|rog|ally|thinkpad|latitude|xps)\s*\w*\s*\w*)', _re.I),
+    # Tab models
+    _re.compile(r'(tab\s*(?:s|a)?\s*\d+\s*(?:fe|lite|ultra|plus)?)', _re.I),
+]
+
+
+def _extract_model_id(title: str) -> str | None:
+    """Extract the specific model identifier from a product title."""
+    if not title:
+        return None
+    for pat in _MODEL_PATTERNS:
+        m = pat.search(title)
+        if m:
+            # Normalize whitespace and case
+            return _re.sub(r'\s+', ' ', m.group(1).lower().strip())
+    return None
+
+
+def _titles_match(title_a: str | None, title_b: str | None) -> bool:
+    """Check if two normalized titles refer to the same product.
+
+    Extracts model identifiers (e.g. 'iphone 17 pro', 'galaxy s25 ultra')
+    and compares them. If both have a model ID, they must match exactly.
+    Falls back to Jaccard token overlap if no model ID can be extracted.
+    """
+    if not title_a or not title_b:
+        return True
+
+    # Try model-based matching first
+    model_a = _extract_model_id(title_a)
+    model_b = _extract_model_id(title_b)
+
+    if model_a and model_b:
+        return model_a == model_b
+
+    # If only one has a model ID, they're likely different products
+    if bool(model_a) != bool(model_b):
+        return False
+
+    # Fallback: Jaccard token overlap (neither has model ID)
+    tokens_a = set(title_a.lower().split())
+    tokens_b = set(title_b.lower().split())
+
+    stop = {"de", "para", "con", "en", "el", "la", "los", "las", "un", "una",
+            "del", "al", "y", "o", "a", "e", "the", "for", "with", "and", "in",
+            "color", "negro", "blanco", "gris", "azul", "rojo", "black", "white",
+            "grey", "blue", "red", "green", "pink", "silver", "gold"}
+    tokens_a = {t for t in tokens_a if len(t) > 1 and t not in stop}
+    tokens_b = {t for t in tokens_b if len(t) > 1 and t not in stop}
+
+    if not tokens_a or not tokens_b:
+        return True
+
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    jaccard = len(intersection) / len(union)
+
+    return jaccard >= 0.50
+
+
 # ── Configurable thresholds (v3: relaxed hard filters) ────
 MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "1"))
 MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.01"))       # 1% — soft penalties below 8%
@@ -542,11 +626,12 @@ async def _analyze_product(
             buy_candidate = min(buy_listings, key=lambda l: to_usd(float(l.price), l.currency, rates))
             buy_usd = to_usd(float(buy_candidate.price), buy_candidate.currency, rates)
 
-            # Compatible sells (same condition + variant)
+            # Compatible sells (same condition + variant + title match)
             compatible = [
                 s for s in sell_listings
                 if buy_candidate.condition == s.condition
                 and variants_compatible(buy_candidate, s)
+                and _titles_match(buy_candidate.title, s.title)
             ]
             if not compatible:
                 continue

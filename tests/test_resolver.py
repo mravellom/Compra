@@ -1,16 +1,21 @@
 """
-Integration Tests — Vector DB (Product Resolver)
+Tests — Product Resolver (In-Memory Index)
 
-Usa pytest-mock (mocker) para simular pgvector.
-Lógica de negocio verificada:
-  - similarity >= 0.85 → vincula al ID existente (is_new=False)
-  - similarity  = 0.84 → crea producto nuevo    (is_new=True)
-  - DB vacía            → crea primer producto   (is_new=True)
+Verifica matching vía batch_resolve() con índice numpy en memoria:
+  - Alta similitud   → vincula al producto existente (is_new=False)
+  - Baja similitud   → crea producto nuevo           (is_new=True)
+  - Index vacío      → crea primer producto           (is_new=True)
+  - Borderline above → vincula (global threshold 0.82)
+  - Borderline below → crea nuevo
 """
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
+
+from processor.normalizer import normalize_title, extract_brand, extract_model
+from processor.product_index import ProductIndex
+from processor.resolver import MatchResult, batch_resolve, _match_cache
 
 
 # ─── Helpers ────────────────────────────────────────────────────────
@@ -22,27 +27,46 @@ def make_fake_embedding(seed: int, dim: int = 384) -> list[float]:
     return (vec / np.linalg.norm(vec)).tolist()
 
 
+def make_similar_embedding(base: list[float], target_sim: float, dim: int = 384) -> list[float]:
+    """Create a normalized embedding with a specific cosine similarity to base.
+
+    Uses Gram-Schmidt orthogonalization to construct a vector at exactly
+    arccos(target_sim) radians from base.
+    """
+    b = np.array(base, dtype=np.float32)
+    b = b / np.linalg.norm(b)
+
+    rng = np.random.RandomState(999)
+    rand_vec = rng.randn(dim).astype(np.float32)
+    orth = rand_vec - np.dot(rand_vec, b) * b
+    orth = orth / np.linalg.norm(orth)
+
+    theta = np.arccos(np.clip(target_sim, -1.0, 1.0))
+    result = float(np.cos(theta)) * b + float(np.sin(theta)) * orth
+    result = result / np.linalg.norm(result)
+    return result.tolist()
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Calcula similitud coseno entre dos vectores."""
     a_arr, b_arr = np.array(a), np.array(b)
     return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
 
 
-class _FakeAsyncCtx:
-    """Generic async context manager that returns a value."""
+def build_index(products: list[tuple]) -> ProductIndex:
+    """Create a populated ProductIndex.
 
-    def __init__(self, value):
-        self._value = value
-
-    async def __aenter__(self):
-        return self._value
-
-    async def __aexit__(self, *args):
-        pass
+    Each product: (id, canonical_name, brand, model, embedding)
+    """
+    index = ProductIndex()
+    for pid, name, brand, model, emb in products:
+        index.append(pid, name, brand, model, None, emb)
+    index._loaded = True
+    return index
 
 
 class _FakeAcquire:
-    """Simula pool.acquire() — sync call que retorna async context manager."""
+    """Simula pool.acquire() como async context manager."""
 
     def __init__(self, conn):
         self._conn = conn
@@ -54,30 +78,51 @@ class _FakeAcquire:
         pass
 
 
-def _patch_resolver(mocker, mock_conn, embedding_seed=42):
-    """Aplica los patches comunes a get_pool, generate_embedding y FX rates."""
-    # conn.transaction() is a sync call that returns an async context manager
-    # (asyncpg pattern). Override the AsyncMock's transaction to be a plain MagicMock.
-    mock_conn.transaction = MagicMock(return_value=_FakeAsyncCtx(None))
-    # conn.fetch for _price_compatible — return empty list (no existing listings)
-    mock_conn.fetch = AsyncMock(return_value=[])
+FAKE_RATES = {
+    "USD": 1.0, "ARS": 1450.0, "MXN": 17.8,
+    "EUR": 0.86, "GBP": 0.75, "BRL": 5.10,
+    "CLP": 950.0, "COP": 4200.0, "CNY": 7.2,
+}
 
-    # pool.acquire() es sync (no awaited), retorna async ctx manager
-    pool = MagicMock()
-    pool.acquire.return_value = _FakeAcquire(mock_conn)
 
-    # get_pool() es async, retorna el pool
-    async def fake_get_pool():
-        return pool
+def _patch_resolver(mocker, index, mock_db_rows=None):
+    """Patch get_index, get_pool, and FX rates for batch_resolve tests.
 
-    mocker.patch("processor.resolver.get_pool", side_effect=fake_get_pool)
-    mocker.patch("processor.resolver.generate_embedding", return_value=make_fake_embedding(embedding_seed))
+    Args:
+        index: ProductIndex to return from get_index().
+        mock_db_rows: If given, list[dict] for the DB INSERT RETURNING response
+                      (needed when batch_resolve creates new products).
+    Returns:
+        mock_conn (AsyncMock) if mock_db_rows was provided, else None.
+    """
+    mocker.patch("processor.resolver.get_index", return_value=index)
 
-    # Patch FX rates so _price_compatible doesn't hit the network
-    async def fake_get_rates():
-        return {"USD": 1.0, "ARS": 1450.0, "MXN": 17.8, "EUR": 0.86, "GBP": 0.75, "BRL": 5.10}
+    async def fake_rates():
+        return FAKE_RATES
+    mocker.patch("processor.resolver.get_rates", side_effect=fake_rates)
 
-    mocker.patch("processor.resolver.get_rates", side_effect=fake_get_rates)
+    if mock_db_rows is not None:
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=mock_db_rows)
+
+        pool = MagicMock()
+        pool.acquire.return_value = _FakeAcquire(mock_conn)
+
+        async def fake_get_pool():
+            return pool
+        mocker.patch("processor.resolver.get_pool", side_effect=fake_get_pool)
+
+        return mock_conn
+
+    return None
+
+
+@pytest.fixture(autouse=True)
+def clear_cache():
+    """Clear resolver match cache before/after each test."""
+    _match_cache.clear()
+    yield
+    _match_cache.clear()
 
 
 # ─── Tests de matching ──────────────────────────────────────────────
@@ -86,111 +131,164 @@ class TestResolverMatching:
 
     @pytest.mark.asyncio
     async def test_high_similarity_links_to_existing(self, mocker):
-        """similarity=0.99 → debe vincular al producto existente (is_new=False)."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.return_value = {
-            "id": 1, "canonical_name": "sony wh1000xm4", "similarity": 0.99,
-        }
-        _patch_resolver(mocker, mock_conn, 42)
+        """Embedding idéntico → vincula al producto existente (is_new=False)."""
+        emb = make_fake_embedding(42)
+        index = build_index([(1, "sony wh1000xm4", "sony", "wh1000xm4", emb)])
+        _patch_resolver(mocker, index)
 
-        from processor.resolver import resolve_product
-        result = await resolve_product("Sony WH-1000XM4 Headphones")
+        results = await batch_resolve(
+            titles=["Sony WH-1000XM4 Headphones"],
+            embeddings=[emb],
+            prices=[299.0],
+            currencies=["USD"],
+        )
 
-        assert result.is_new is False
-        assert result.master_product_id == 1
-        assert result.canonical_name == "sony wh1000xm4"
-        assert result.similarity == 0.99
-        mock_conn.fetchval.assert_not_called()
+        assert results[0].is_new is False
+        assert results[0].master_product_id == 1
+        assert results[0].canonical_name == "sony wh1000xm4"
+        assert results[0].similarity > 0.95
 
     @pytest.mark.asyncio
     async def test_low_similarity_creates_new_product(self, mocker):
-        """similarity=0.42 → debe crear un nuevo master product (is_new=True)."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.return_value = {
-            "id": 5, "canonical_name": "bose quietcomfort 45", "similarity": 0.42,
-        }
-        mock_conn.fetchval.return_value = 10
-        _patch_resolver(mocker, mock_conn, 99)
+        """Baja similitud → crea un nuevo master product (is_new=True)."""
+        existing_emb = make_fake_embedding(42)
+        query_emb = make_fake_embedding(99)  # vector muy diferente
 
-        from processor.resolver import resolve_product
-        result = await resolve_product("Completely Different Product XYZ")
+        index = build_index([
+            (5, "bose quietcomfort 45", "bose", "quietcomfort45", existing_emb),
+        ])
 
-        assert result.is_new is True
-        assert result.master_product_id == 10
-        assert result.similarity == 1.0
-        mock_conn.fetchval.assert_called_once()
+        title = "Completely Different Product XYZ"
+        expected_name = normalize_title(title)
+
+        _patch_resolver(mocker, index, mock_db_rows=[
+            {"id": 10, "canonical_name": expected_name, "was_inserted": True},
+        ])
+
+        results = await batch_resolve(
+            titles=[title],
+            embeddings=[query_emb],
+            prices=[50.0],
+            currencies=["USD"],
+        )
+
+        assert results[0].is_new is True
+        assert results[0].master_product_id == 10
+        assert results[0].similarity == 1.0
 
     @pytest.mark.asyncio
     async def test_empty_db_creates_first_product(self, mocker):
-        """DB vacía (fetchrow=None) → crea el primer producto."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.return_value = None
-        mock_conn.fetchval.return_value = 1
-        _patch_resolver(mocker, mock_conn, 1)
+        """Index vacío → crea el primer producto."""
+        emb = make_fake_embedding(1)
+        index = build_index([])  # empty
 
-        from processor.resolver import resolve_product
-        result = await resolve_product("Sony WH-1000XM4")
+        title = "Sony WH-1000XM4"
+        expected_name = normalize_title(title)
 
-        assert result.is_new is True
-        assert result.master_product_id == 1
-        mock_conn.fetchval.assert_called_once()
+        _patch_resolver(mocker, index, mock_db_rows=[
+            {"id": 1, "canonical_name": expected_name, "was_inserted": True},
+        ])
+
+        results = await batch_resolve(
+            titles=[title],
+            embeddings=[emb],
+            prices=[299.0],
+            currencies=["USD"],
+        )
+
+        assert results[0].is_new is True
+        assert results[0].master_product_id == 1
 
     @pytest.mark.asyncio
     async def test_borderline_088_matches(self, mocker):
-        """EXACTAMENTE 0.88 (global embedding threshold) → DEBE matchear."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.return_value = {
-            "id": 3, "canonical_name": "apple airpods pro", "similarity": 0.88,
-        }
-        _patch_resolver(mocker, mock_conn, 7)
+        """Similitud 0.84 (above global threshold 0.82) → DEBE matchear.
 
-        from processor.resolver import resolve_product
-        result = await resolve_product("AirPods Pro 2")
+        Uses different brand to force global-level matching.
+        """
+        base_emb = make_fake_embedding(42)
+        query_emb = make_similar_embedding(base_emb, 0.84)
 
-        assert result.is_new is False
-        assert result.master_product_id == 3
-        assert result.similarity == 0.88
-        mock_conn.fetchval.assert_not_called()
+        # Different brand → brand/model levels won't match → falls to global (0.82)
+        index = build_index([
+            (3, "generic headphones model z", None, None, base_emb),
+        ])
+        _patch_resolver(mocker, index)
+
+        results = await batch_resolve(
+            titles=["Another Generic Headphones Set"],
+            embeddings=[query_emb],
+            prices=[100.0],
+            currencies=["USD"],
+        )
+
+        assert results[0].is_new is False
+        assert results[0].master_product_id == 3
+        assert results[0].similarity >= 0.82
 
     @pytest.mark.asyncio
     async def test_borderline_087_creates_new(self, mocker):
-        """0.87 → just below global threshold (0.88), DEBE crear nuevo."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.return_value = {
-            "id": 3, "canonical_name": "apple airpods pro", "similarity": 0.87,
-        }
-        mock_conn.fetchval.return_value = 20
-        _patch_resolver(mocker, mock_conn, 8)
+        """Similitud 0.80 (below global threshold 0.82) → DEBE crear nuevo."""
+        base_emb = make_fake_embedding(42)
+        query_emb = make_similar_embedding(base_emb, 0.80)
 
-        from processor.resolver import resolve_product
-        result = await resolve_product("Something Almost Similar")
+        index = build_index([
+            (3, "generic headphones model z", None, None, base_emb),
+        ])
 
-        assert result.is_new is True
-        assert result.master_product_id == 20
-        mock_conn.fetchval.assert_called_once()
+        title = "Something Almost Similar"
+        expected_name = normalize_title(title)
+
+        _patch_resolver(mocker, index, mock_db_rows=[
+            {"id": 20, "canonical_name": expected_name, "was_inserted": True},
+        ])
+
+        results = await batch_resolve(
+            titles=[title],
+            embeddings=[query_emb],
+            prices=[100.0],
+            currencies=["USD"],
+        )
+
+        assert results[0].is_new is True
+        assert results[0].master_product_id == 20
 
     @pytest.mark.asyncio
     async def test_insert_receives_correct_brand_and_model(self, mocker):
         """Verifica que el INSERT pase brand y model correctos."""
-        mock_conn = AsyncMock()
-        mock_conn.fetchrow.return_value = None
-        mock_conn.fetchval.return_value = 50
-        _patch_resolver(mocker, mock_conn, 5)
+        emb = make_fake_embedding(5)
+        index = build_index([])  # empty → forces creation
 
-        from processor.resolver import resolve_product
-        result = await resolve_product("Sony WH-1000XM4 Wireless")
+        title = "Sony WH-1000XM4 Wireless"
+        expected_name = normalize_title(title)
+        expected_brand = extract_brand(expected_name)
+        expected_model = extract_model(expected_name, expected_brand)
 
-        assert result.is_new is True
-        call_args = mock_conn.fetchval.call_args[0]
+        mock_conn = _patch_resolver(mocker, index, mock_db_rows=[
+            {"id": 50, "canonical_name": expected_name, "was_inserted": True},
+        ])
+
+        results = await batch_resolve(
+            titles=[title],
+            embeddings=[emb],
+            prices=[299.0],
+            currencies=["USD"],
+        )
+
+        assert results[0].is_new is True
+        assert results[0].master_product_id == 50
+
+        # Verify the DB INSERT was called with correct brand/model
+        mock_conn.fetch.assert_called_once()
+        call_args = mock_conn.fetch.call_args[0]
         sql = call_args[0]
-        canonical_name = call_args[1]
-        brand = call_args[2]
-        model = call_args[3]
+        batch_names = call_args[1]
+        batch_brands = call_args[2]
+        batch_models = call_args[3]
 
         assert "INSERT INTO master_products" in sql
-        assert "sony" in canonical_name
-        assert brand == "sony"
-        assert model == "wh1000xm4"
+        assert expected_name in batch_names
+        assert expected_brand in batch_brands
+        assert expected_model in batch_models
 
 
 # ─── Tests de stable hash ──────────────────────────────────────────
@@ -241,3 +339,11 @@ class TestCosineSimilarityMath:
         noise = np.array(base) + np.random.RandomState(0).randn(384) * 0.01
         perturbed = (noise / np.linalg.norm(noise)).tolist()
         assert cosine_similarity(base, perturbed) > 0.95
+
+    def test_make_similar_embedding_produces_target_sim(self):
+        """Verify that make_similar_embedding produces the requested similarity."""
+        base = make_fake_embedding(42)
+        for target in [0.50, 0.75, 0.82, 0.90, 0.99]:
+            similar = make_similar_embedding(base, target)
+            actual = cosine_similarity(base, similar)
+            assert actual == pytest.approx(target, abs=0.01)

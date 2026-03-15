@@ -269,7 +269,7 @@ def _build_search_scrapers(
         AmazonScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
         AmazonUSScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
         AliExpressScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
-        EbayScraper(),
+        EbayScraper(rate_limiter=rate_limiter, proxy_pool=proxy_pool),
     ]
 
 

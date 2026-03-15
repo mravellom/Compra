@@ -1,4 +1,4 @@
-import { Component, inject, OnInit, ViewChild } from '@angular/core';
+import { Component, inject, OnInit, OnDestroy, ViewChild } from '@angular/core';
 import { OpportunityService } from '../../services/opportunity.service';
 import { StatsBarComponent } from '../stats-bar/stats-bar.component';
 import { SidebarComponent } from '../sidebar/sidebar.component';
@@ -89,7 +89,7 @@ import { OpportunityDetailComponent } from '../opportunity-detail/opportunity-de
     }
   `,
 })
-export class DashboardComponent implements OnInit {
+export class DashboardComponent implements OnInit, OnDestroy {
   @ViewChild(SidebarComponent) sidebar!: SidebarComponent;
 
   svc = inject(OpportunityService);
@@ -98,6 +98,11 @@ export class DashboardComponent implements OnInit {
   ngOnInit(): void {
     this.svc.loadOpportunities();
     this.svc.loadStats();
+    this.svc.startPolling();
+  }
+
+  ngOnDestroy(): void {
+    this.svc.stopPolling();
   }
 
   toggleSidebar(): void {

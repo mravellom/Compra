@@ -1,11 +1,12 @@
-import { Injectable, signal, computed } from '@angular/core';
+import { Injectable, signal, computed, OnDestroy } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Opportunity, OpportunityDetail, DashboardStats, OpportunityFilters } from '../models/opportunity.model';
 
 const API_BASE = '/api/v1';
+const POLL_INTERVAL = 30_000; // 30 seconds
 
 @Injectable({ providedIn: 'root' })
-export class OpportunityService {
+export class OpportunityService implements OnDestroy {
   // State signals
   readonly opportunities = signal<Opportunity[]>([]);
   readonly stats = signal<DashboardStats>({
@@ -23,6 +24,8 @@ export class OpportunityService {
     max_buy_price: 1000,
     marketplaces: [],
   });
+
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   // Computed: filtered opportunities (client-side for instant UI response)
   readonly filteredOpportunities = computed(() => {
@@ -54,8 +57,27 @@ export class OpportunityService {
 
   constructor(private http: HttpClient) {}
 
-  loadOpportunities(): void {
-    this.loading.set(true);
+  startPolling(): void {
+    this.stopPolling();
+    this.pollTimer = setInterval(() => {
+      this.loadOpportunities(true);
+      this.loadStats();
+    }, POLL_INTERVAL);
+  }
+
+  stopPolling(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  ngOnDestroy(): void {
+    this.stopPolling();
+  }
+
+  loadOpportunities(silent = false): void {
+    if (!silent) this.loading.set(true);
     const f = this.filters();
     let params = new HttpParams().set('limit', '200');
     if (f.min_roi > 0) params = params.set('min_roi', f.min_roi.toString());

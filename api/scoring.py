@@ -56,11 +56,12 @@ def _normalize_roi(roi: float) -> float:
     return min(100, 100 * (1 - math.exp(-2.5 * roi)))
 
 
-def _normalize_profit(profit_usd: float, ceiling: float = 200.0) -> float:
-    """Map USD profit to 0-100. $200+ = 100."""
+def _normalize_profit(profit_usd: float, ceiling: float = 100.0) -> float:
+    """Map USD profit to 0-100 using diminishing returns.
+    $50 → ~63, $100 → ~92, $200 → ~99. Realistic for marketplace arbitrage."""
     if profit_usd <= 0:
         return 0
-    return min(100, (profit_usd / ceiling) * 100)
+    return min(100, 100 * (1 - math.exp(-3.0 * profit_usd / ceiling)))
 
 
 def _normalize_listing_volume(competitor_count: int) -> float:
@@ -102,21 +103,29 @@ def _normalize_demand(
     market_depth_score: float,
 ) -> float:
     """Marketplace demand from sales signals.
-    Combines observed sales, reviews as proxy, and depth estimation."""
-    # Direct sales signal
-    sales_signal = min(100, sales_count * 0.5) if sales_count > 0 else 0
+    Combines observed sales, reviews as proxy, and depth estimation.
 
-    # Reviews as demand proxy (1 review ≈ 33 sales for electronics)
-    review_signal = min(100, reviews_count * 1.5) if reviews_count > 0 else 0
+    v3.1: Reviews are more valuable than before — most scraped listings have
+    reviews but not direct sales data. A product with 100+ reviews has proven demand.
+    """
+    # Direct sales signal (diminishing returns)
+    sales_signal = min(100, 100 * (1 - math.exp(-0.01 * sales_count))) if sales_count > 0 else 0
+
+    # Reviews as demand proxy — stronger signal than before
+    # 10 reviews → ~45, 50 → ~78, 100 → ~92, 500 → ~100
+    review_signal = min(100, 100 * (1 - math.exp(-0.025 * reviews_count))) if reviews_count > 0 else 0
 
     # Model-estimated daily sales
     daily_signal = min(100, estimated_daily_sales * 20) if estimated_daily_sales > 0 else 0
 
     # Weighted combination — prefer direct evidence
     if sales_count > 0:
-        return sales_signal * 0.4 + review_signal * 0.2 + daily_signal * 0.2 + market_depth_score * 0.2
+        return sales_signal * 0.35 + review_signal * 0.25 + daily_signal * 0.20 + market_depth_score * 0.20
+    elif reviews_count > 0:
+        # v3.1: Reviews are still a strong signal — don't penalize as much
+        return review_signal * 0.40 + daily_signal * 0.30 + market_depth_score * 0.30
     else:
-        return review_signal * 0.35 + daily_signal * 0.35 + market_depth_score * 0.3
+        return daily_signal * 0.50 + market_depth_score * 0.50
 
 
 def _normalize_volatility(stability_score: float) -> float:
@@ -353,53 +362,53 @@ def compute_confidence_score(inp: ScoringInput) -> tuple[float, str]:
     Returns (score, level).
     """
     # Data coverage: count how many signals are non-default
-    available_signals = 0
-    total_signals = 7
+    # v3.1: Use weighted signals — some are more valuable than others
+    signal_weights = {
+        "buy_rating": (inp.buy_seller_rating is not None, 1.0),
+        "sell_rating": (inp.sell_seller_rating is not None, 1.0),
+        "sales": (inp.total_sales_count > 0, 1.5),         # Sales data is high-value
+        "reviews": (inp.total_reviews_count > 0, 1.5),      # Reviews are high-value
+        "stability": (inp.price_stability_score != 50.0, 1.0),
+        "daily_sales": (inp.estimated_daily_sales > 0, 1.0),
+        "listing_age": (inp.listing_age_days > 1.0, 0.5),   # Less important
+        "multi_listing": (inp.total_listings >= 3, 1.5),     # Multiple listings = strong signal
+    }
 
-    if inp.buy_seller_rating is not None:
-        available_signals += 1
-    if inp.sell_seller_rating is not None:
-        available_signals += 1
-    if inp.total_sales_count > 0:
-        available_signals += 1
-    if inp.total_reviews_count > 0:
-        available_signals += 1
-    if inp.price_stability_score != 50.0:  # 50 = default/unknown
-        available_signals += 1
-    if inp.estimated_daily_sales > 0:
-        available_signals += 1
-    if inp.listing_age_days > 1.0:
-        available_signals += 1
-
-    data_coverage = (available_signals / total_signals) * 100
+    weighted_available = sum(w for avail, w in signal_weights.values() if avail)
+    weighted_total = sum(w for _, w in signal_weights.values())
+    data_coverage = (weighted_available / weighted_total) * 100
 
     # Signal agreement: check if positive signals align
     factors = _compute_factors(inp)
-    positive_factors = [v for v in factors.values() if v > 50]
+    # v3.1: Count factors > 40 (not 50) — many valid signals land 30-50
+    positive_factors = [v for v in factors.values() if v > 40]
 
     # Strong agreement = most factors point the same direction
     if len(positive_factors) >= 5:
-        signal_agreement = 85
+        signal_agreement = 90
     elif len(positive_factors) >= 4:
-        signal_agreement = 70
+        signal_agreement = 75
     elif len(positive_factors) >= 3:
-        signal_agreement = 55
+        signal_agreement = 60
     else:
         # Mixed signals = low confidence
-        signal_agreement = 30
+        signal_agreement = 35
 
     # Consistency: low variance among factors = signals agree on magnitude
     factor_values = list(factors.values())
     if len(factor_values) >= 2:
-        cv = statistics.stdev(factor_values) / max(statistics.mean(factor_values), 1)
+        mean_val = max(statistics.mean(factor_values), 1)
+        cv = statistics.stdev(factor_values) / mean_val
         consistency_bonus = max(0, (1 - cv) * 20)  # Up to 20 bonus for consistency
         signal_agreement = min(100, signal_agreement + consistency_bonus)
 
     # Recency: more listings = fresher data (proxy)
-    if inp.total_listings >= 10:
-        recency = 90
+    if inp.total_listings >= 8:
+        recency = 95
     elif inp.total_listings >= 5:
-        recency = 70
+        recency = 80
+    elif inp.total_listings >= 3:
+        recency = 65
     elif inp.total_listings >= 2:
         recency = 50
     else:
@@ -416,7 +425,8 @@ def compute_confidence_score(inp: ScoringInput) -> tuple[float, str]:
 
     confidence = round(max(0, min(100, confidence)), 1)
 
-    level = "high" if confidence >= 70 else "medium" if confidence >= 45 else "low"
+    # v3.1: Adjusted thresholds — 70 was unreachable with typical marketplace data
+    level = "high" if confidence >= 60 else "medium" if confidence >= 40 else "low"
     return confidence, level
 
 

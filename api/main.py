@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,8 +15,9 @@ from .routes.categories import router as categories_router
 from .routes.discovery import router as discovery_router
 from .routes.opportunities import router as opportunities_router
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -50,13 +52,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Radar de Oportunidades API",
     description="API para deteccion de arbitraje entre marketplaces",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", "http://localhost:4200,http://localhost"
 ).split(",")
+
+# Production middleware: request logging, rate limiting, API key auth
+from .middleware import ProductionMiddleware
+app.add_middleware(ProductionMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,29 +80,109 @@ app.include_router(discovery_router, prefix="/api/v1")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "timestamp": time.time()}
 
 
 @app.get("/health/pipeline")
 async def pipeline_health():
-    """Detailed pipeline health check with stream metrics."""
+    """Production health check: DB freshness, Redis stream, opportunity quality."""
+    import redis.asyncio as aioredis
+    from .database import async_session
+    from sqlalchemy import text
+
+    alerts = []
+    status = "ok"
+
+    # 1. Check DB connectivity + listing freshness
+    db_status = "ok"
+    freshness_minutes = None
     try:
-        from infra.monitor import PipelineMonitor
-        monitor = PipelineMonitor()
-        snapshot = await monitor.collect_snapshot()
-        return {
-            "status": snapshot.overall_status,
-            "dlq_length": snapshot.dlq_length,
-            "alerts": snapshot.alerts,
-            "streams": {
-                name: {
-                    "length": h.length,
-                    "consumer_lag": h.consumer_lag,
-                    "consumers": h.consumers,
-                    "status": h.status,
-                }
-                for name, h in snapshot.streams.items()
-            },
-        }
+        async with async_session() as db:
+            row = await db.execute(text(
+                "SELECT EXTRACT(EPOCH FROM (now() - max(scraped_at)))/60 "
+                "AS minutes_since_last FROM product_listings"
+            ))
+            freshness_minutes = row.scalar()
+            if freshness_minutes is not None:
+                if freshness_minutes > 60:
+                    db_status = "critical"
+                    alerts.append(f"CRITICAL: No new listings for {freshness_minutes:.0f} min")
+                elif freshness_minutes > 30:
+                    db_status = "warning"
+                    alerts.append(f"WARNING: No new listings for {freshness_minutes:.0f} min")
+
+            # Opportunity quality
+            row = await db.execute(text(
+                "SELECT count(*) as total, "
+                "count(*) FILTER (WHERE confidence_level = 'high') as high, "
+                "round(avg(opportunity_score)::numeric, 1) as avg_score "
+                "FROM opportunities WHERE status = 'active'"
+            ))
+            opp_stats = row.mappings().first()
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        db_status = "critical"
+        alerts.append(f"CRITICAL: DB unreachable: {e}")
+        opp_stats = None
+
+    # 2. Check Redis stream lag
+    redis_status = "ok"
+    stream_info = {}
+    try:
+        r = aioredis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+        )
+        try:
+            stream_len = await r.xlen("raw_listings_queue")
+            groups = await r.xinfo_groups("raw_listings_queue")
+            lag = 0
+            pending = 0
+            for g in groups:
+                lag = max(lag, g.get("lag", 0))
+                pending = max(pending, g.get("pending", 0))
+
+            stream_info = {
+                "stream_length": stream_len,
+                "consumer_lag": lag,
+                "pending_messages": pending,
+            }
+
+            if lag > 50000:
+                redis_status = "critical"
+                alerts.append(f"CRITICAL: Redis consumer lag = {lag}")
+            elif lag > 10000:
+                redis_status = "warning"
+                alerts.append(f"WARNING: Redis consumer lag = {lag}")
+        finally:
+            await r.aclose()
+    except Exception as e:
+        redis_status = "critical"
+        alerts.append(f"CRITICAL: Redis unreachable: {e}")
+
+    # 3. Overall status
+    statuses = [db_status, redis_status]
+    if "critical" in statuses:
+        status = "critical"
+    elif "warning" in statuses:
+        status = "warning"
+
+    return {
+        "status": status,
+        "timestamp": time.time(),
+        "database": {
+            "status": db_status,
+            "minutes_since_last_listing": round(freshness_minutes, 1) if freshness_minutes else None,
+        },
+        "redis": {
+            "status": redis_status,
+            **stream_info,
+        },
+        "opportunities": {
+            "total": opp_stats["total"] if opp_stats else 0,
+            "high_confidence": opp_stats["high"] if opp_stats else 0,
+            "avg_score": float(opp_stats["avg_score"]) if opp_stats and opp_stats["avg_score"] else 0,
+        },
+        "alerts": alerts,
+    }
+
+
