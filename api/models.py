@@ -192,6 +192,87 @@ class CategoryArbitrageStats(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# ============================================================
+# Price Prediction Engine
+# ============================================================
+
+class PricePrediction(Base):
+    __tablename__ = "price_predictions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("master_products.id"), nullable=False)
+    model_type: Mapped[str] = mapped_column(Text, default="baseline")
+    horizon_days: Mapped[int] = mapped_column(Integer, default=7)
+    predicted_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    confidence_lower: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    confidence_upper: Mapped[float | None] = mapped_column(Numeric(12, 2))
+    mape: Mapped[float | None] = mapped_column(REAL)
+    confidence: Mapped[float] = mapped_column(REAL, default=0.5)
+    features_used: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    status: Mapped[str] = mapped_column(Text, default="computed")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============================================================
+# Trend Detection Engine
+# ============================================================
+
+class ProductTrend(Base):
+    __tablename__ = "product_trends"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("master_products.id"), nullable=False, unique=True)
+    trend_score: Mapped[float] = mapped_column(REAL, default=0)
+    velocity_ratio: Mapped[float] = mapped_column(REAL, default=0)
+    price_momentum: Mapped[float] = mapped_column(REAL, default=0)
+    volume_change: Mapped[float] = mapped_column(REAL, default=0)
+    trend_type: Mapped[str] = mapped_column(Text, default="stable")
+    trend_strength: Mapped[str] = mapped_column(Text, default="weak")
+    signals: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============================================================
+# Execution Engine
+# ============================================================
+
+class ExecutionOrder(Base):
+    __tablename__ = "execution_orders"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    opportunity_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("opportunities.id"))
+    product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("master_products.id"), nullable=False)
+    order_type: Mapped[str] = mapped_column(Text, nullable=False)
+    marketplace: Mapped[str] = mapped_column(Text, nullable=False)
+    price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    total_cost: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    estimated_profit: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    status: Mapped[str] = mapped_column(Text, default="draft")
+    approval_state: Mapped[str] = mapped_column(Text, default="pending")
+    execution_mode: Mapped[str] = mapped_column(Text, default="manual")
+    risk_assessment: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    error_message: Mapped[str | None] = mapped_column(Text)
+    approved_by: Mapped[str | None] = mapped_column(Text)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExecutionLog(Base):
+    __tablename__ = "execution_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    order_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("execution_orders.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    old_status: Mapped[str | None] = mapped_column(Text)
+    new_status: Mapped[str | None] = mapped_column(Text)
+    details: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    actor: Mapped[str] = mapped_column(Text, default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AlertConfig(Base):
     __tablename__ = "alert_configs"
 

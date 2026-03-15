@@ -15,6 +15,12 @@ from .routes.categories import router as categories_router
 from .routes.discovery import router as discovery_router
 from .routes.opportunities import router as opportunities_router
 
+# Engine routers
+from engines.prediction.api.routes import router as prediction_router
+from engines.trend.api.routes import router as trend_router
+from engines.execution.api.routes import router as execution_router
+from engines.orchestrator.api.routes import router as orchestrator_router
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -76,6 +82,12 @@ app.include_router(opportunities_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
 app.include_router(categories_router, prefix="/api/v1")
 app.include_router(discovery_router, prefix="/api/v1")
+
+# Engine routers
+app.include_router(prediction_router, prefix="/api/v1")
+app.include_router(trend_router, prefix="/api/v1")
+app.include_router(execution_router, prefix="/api/v1")
+app.include_router(orchestrator_router, prefix="/api/v1")
 
 
 @app.get("/health")
