@@ -238,7 +238,7 @@ async def batch_resolve(
                 batch_brands.append(brand)
                 batch_models.append(model)
                 batch_categories.append(category)
-                batch_embeddings.append(np.array(embedding, dtype=np.float32))
+                batch_embeddings.append(np.array(embedding, dtype=np.float32).flatten())
                 task_map.append((ui, j, normalized, brand, model, embedding, price, currency, category))
             else:
                 # Will resolve after the batch insert using row_map
@@ -254,7 +254,8 @@ async def batch_resolve(
                     ON CONFLICT (canonical_name) DO UPDATE SET updated_at = now()
                     RETURNING id, canonical_name, (xmax = 0) AS was_inserted
                     """,
-                    batch_names, batch_brands, batch_models, batch_categories, batch_embeddings,
+                    batch_names, batch_brands, batch_models, batch_categories,
+                    [np.asarray(e, dtype=np.float32).flatten() for e in batch_embeddings],
                 )
 
             # Build lookup by canonical_name
@@ -329,7 +330,7 @@ async def batch_resolve(
                             ON CONFLICT (canonical_name) DO UPDATE SET updated_at = now()
                             RETURNING id, (xmax = 0) AS was_inserted
                             """,
-                            normalized, brand, model, category, np.array(embedding),
+                            normalized, brand, model, category, np.array(embedding).flatten(),
                         )
                     new_id = row["id"]
                     was_inserted = row["was_inserted"]
@@ -338,10 +339,11 @@ async def batch_resolve(
                         index.append(new_id, normalized, brand, model, category, embedding)
                     else:
                         resolver_metrics.db_create_conflicts += 1
-                    results[ui] = MatchResult(
+                    result = MatchResult(
                         master_product_id=new_id, canonical_name=normalized,
                         similarity=1.0, is_new=was_inserted,
                     )
+                    results[ui] = result
                     cache_key = f"{normalized}:{price:.2f}:{currency}"
                     _cache_put(cache_key, result)
                 except Exception:

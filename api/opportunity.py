@@ -138,7 +138,7 @@ def _titles_match(title_a: str | None, title_b: str | None) -> bool:
     union = tokens_a | tokens_b
     jaccard = len(intersection) / len(union)
 
-    return jaccard >= 0.50
+    return jaccard >= 0.25
 
 
 # ── Configurable thresholds (v3: relaxed hard filters) ────
@@ -271,23 +271,31 @@ MAIN_PRODUCT_KEYWORDS = (
 
 def _is_accessory(title_lower: str) -> bool:
     """Check if a title refers to an accessory/part."""
-    # If it has main product keywords, not an accessory
-    for kw in MAIN_PRODUCT_KEYWORDS:
-        if kw in title_lower:
-            return False
-    for kw in ACCESSORY_KEYWORDS:
-        if kw in title_lower:
-            return True
-    return False
+    # Accessory keywords take priority — "funda para auriculares" is an accessory
+    is_acc = any(kw in title_lower for kw in ACCESSORY_KEYWORDS)
+    if not is_acc:
+        return False
+    # "funda para auriculares" → accessory; but "auriculares con funda" → not accessory
+    # Heuristic: if accessory keyword appears before main product keyword, it's an accessory
+    acc_pos = min((title_lower.index(kw) for kw in ACCESSORY_KEYWORDS if kw in title_lower), default=999)
+    main_pos = min((title_lower.index(kw) for kw in MAIN_PRODUCT_KEYWORDS if kw in title_lower), default=999)
+    if main_pos == 999:
+        return True  # No main product keyword, just accessory
+    return acc_pos < main_pos
 
 
 def _extract_model_numbers(title: str) -> set[str]:
-    """Extract model identifiers like 'edge 540', 'wh-1000xm4', 'umc202hd'."""
+    """Extract model identifiers like 'edge 540', 'wh-1000xm4', 'tank 720'."""
     import re
     # Match patterns: letters+numbers (wh1000xm4), numbers after brand words (edge 540)
     patterns = re.findall(r'\b([a-z]+[\-]?\d{2,}[a-z0-9]*)\b', title)
-    # Also match standalone model numbers like "540", "1040" after known product words
-    model_words = re.findall(r'\b(?:edge|hero|mini|v|series|pro|wh|wf|xm)\s*(\d{2,}[a-z0-9]*)\b', title)
+    # Match standalone model numbers after known product words
+    model_words = re.findall(
+        r'\b(?:edge|hero|mini|v|series|pro|wh|wf|xm|tank|tab|redmi|note|'
+        r'pad|watch|buds|band|ecotank|pixma|envy|deskjet|laserjet|'
+        r'l|gt|rtx|rx|ryzen|core\s*i)\s*(\d{2,}[a-z0-9]*)\b',
+        title,
+    )
     return set(p.replace("-", "") for p in patterns) | set(model_words)
 
 
@@ -298,6 +306,13 @@ def variants_compatible(buy: ProductListing, sell: ProductListing) -> bool:
         return False
 
     b, s = buy.title.lower(), sell.title.lower()
+
+    # Refurbished detection from title (scrapers may miss condition)
+    _refurb_keywords = ("reacond", "refurbish", "renewed", "remanufactur", "renovado")
+    b_refurb = any(k in b for k in _refurb_keywords)
+    s_refurb = any(k in s for k in _refurb_keywords)
+    if b_refurb != s_refurb:
+        return False
 
     # Accessory vs main product mismatch
     b_acc = _is_accessory(b)
@@ -313,9 +328,11 @@ def variants_compatible(buy: ProductListing, sell: ProductListing) -> bool:
         logger.debug("Model mismatch: %s vs %s", b_models, s_models)
         return False
 
-    # Storage mismatch
-    b_storage = next((v for v in VARIANT_STORAGE if v in b), None)
-    s_storage = next((v for v in VARIANT_STORAGE if v in s), None)
+    # Storage mismatch (normalize "256 gb" → "256gb")
+    b_norm = b.replace(" gb", "gb").replace(" tb", "tb")
+    s_norm = s.replace(" gb", "gb").replace(" tb", "tb")
+    b_storage = next((v for v in VARIANT_STORAGE if v in b_norm), None)
+    s_storage = next((v for v in VARIANT_STORAGE if v in s_norm), None)
     if b_storage and s_storage and b_storage != s_storage:
         return False
 
@@ -323,6 +340,14 @@ def variants_compatible(buy: ProductListing, sell: ProductListing) -> bool:
     b_cap = next((v for v in VARIANT_CAPACITY if v in b.replace(" ", "")), None)
     s_cap = next((v for v in VARIANT_CAPACITY if v in s.replace(" ", "")), None)
     if b_cap and s_cap and b_cap != s_cap:
+        return False
+
+    # Console edition mismatch: "disco"/"disc" vs "digital"/"edición digital"
+    b_has_disc = any(k in b for k in ("unidad de disco", "disc edition", "con disco", "con lector"))
+    s_has_disc = any(k in s for k in ("unidad de disco", "disc edition", "con disco", "con lector"))
+    b_digital_only = any(k in b for k in ("edición digital", "edicion digital", "digital edition")) and not b_has_disc
+    s_digital_only = any(k in s for k in ("edición digital", "edicion digital", "digital edition")) and not s_has_disc
+    if b_has_disc != s_has_disc or b_digital_only != s_digital_only:
         return False
 
     # Bundle mismatch
@@ -584,17 +609,20 @@ async def _analyze_product(
     )
     all_listings = list(result.scalars().all())
     if len(all_listings) < 2:
+        logger.debug("[scan] product %d: only %d listings, skip", product_id, len(all_listings))
         return None
 
     # Filter untrusted
     trusted = [l for l in all_listings if is_trustworthy(l)]
     if len(trusted) < 2:
+        logger.debug("[scan] product %d: only %d trusted (of %d), skip", product_id, len(trusted), len(all_listings))
         return None
 
     # Remove outliers
     prices_usd = [to_usd(float(l.price), l.currency, rates) for l in trusted]
     trusted = [l for l, p in zip(trusted, prices_usd) if not is_outlier_price(p, prices_usd)]
     if len(trusted) < 2:
+        logger.debug("[scan] product %d: only %d after outlier removal, skip", product_id, len(trusted))
         return None
 
     # Group by marketplace
@@ -603,6 +631,7 @@ async def _analyze_product(
         by_mp.setdefault(l.marketplace_id, []).append(l)
 
     if len(by_mp) < 2:
+        logger.debug("[scan] product %d: only %d marketplaces after filtering, skip", product_id, len(by_mp))
         return None
 
     velocity = compute_velocity(trusted)
@@ -617,6 +646,7 @@ async def _analyze_product(
                 continue
             # Only evaluate valid arbitrage routes
             if (buy_mp, sell_mp) not in VALID_ROUTE_PAIRS:
+                logger.debug("[scan] product %d: route %s→%s not valid", product_id, buy_mp, sell_mp)
                 continue
 
             buy_listings = by_mp[buy_mp]
@@ -634,6 +664,16 @@ async def _analyze_product(
                 and _titles_match(buy_candidate.title, s.title)
             ]
             if not compatible:
+                # Log why no compatible sells
+                for s in sell_listings:
+                    reasons = []
+                    if buy_candidate.condition != s.condition:
+                        reasons.append(f"condition {buy_candidate.condition}!={s.condition}")
+                    if not variants_compatible(buy_candidate, s):
+                        reasons.append("variants_incompatible")
+                    if not _titles_match(buy_candidate.title, s.title):
+                        reasons.append("titles_no_match")
+                    logger.debug("[scan] product %d: %s→%s sell rejected: %s", product_id, buy_mp, sell_mp, ", ".join(reasons))
                 continue
 
             # Analyze competition ONLY among compatible listings.
