@@ -3,5 +3,20 @@
     "target": "http://localhost:8000",
     "secure": false,
     "changeOrigin": true
+  },
+  "/health": {
+    "target": "http://localhost:8000",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/metrics": {
+    "target": "http://localhost:8000",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/monetization": {
+    "target": "http://localhost:8000",
+    "secure": false,
+    "changeOrigin": true
   }
 }
