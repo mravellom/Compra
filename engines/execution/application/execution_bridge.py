@@ -1,11 +1,13 @@
 """
-Execution Bridge — connects Orchestrator decisions to Execution Engine.
+Execution Bridge — connects Portfolio Optimizer to Execution Engine.
 
-Consumes 'orchestrator_events' Redis Stream and automatically creates
-trade orders for EXECUTE decisions that meet confidence thresholds.
+Consumes events from Redis Stream and automatically creates
+trade orders for selected opportunities.
 
 Pipeline position:
-  Orchestrator → Redis(orchestrator_events) → ExecutionBridge → ExecutionService
+  Orchestrator → PortfolioOptimizer → Redis(execution_selected) → ExecutionBridge → ExecutionService
+
+Falls back to consuming orchestrator_events directly if no optimizer is running.
 
 Design patterns:
   - Consumer/Producer (Redis Streams)
@@ -25,7 +27,8 @@ from .execution_service import ExecutionService
 
 logger = logging.getLogger(__name__)
 
-STREAM_NAME = "orchestrator_events"
+# Primary: consume optimizer-selected events; fallback: raw orchestrator events
+STREAM_NAME = os.getenv("BRIDGE_INPUT_STREAM", "execution_selected")
 GROUP_NAME = "execution_bridge"
 CONSUMER_NAME = os.getenv("BRIDGE_CONSUMER_NAME", "bridge-1")
 
@@ -103,7 +106,7 @@ class ExecutionBridge:
         """Process a single orchestrator event."""
         try:
             event_type = fields.get("event_type", "")
-            if event_type != "execution_recommended":
+            if event_type not in ("execution_recommended", "execution_selected"):
                 await self._redis.xack(STREAM_NAME, GROUP_NAME, msg_id)
                 return
 

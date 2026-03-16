@@ -22,6 +22,7 @@ from engines.prediction.api.routes import router as prediction_router
 from engines.trend.api.routes import router as trend_router
 from engines.execution.api.routes import router as execution_router
 from engines.orchestrator.api.routes import router as orchestrator_router
+from engines.portfolio_optimizer.api.routes import router as optimizer_router
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -105,6 +106,7 @@ app.include_router(prediction_router, prefix="/api/v1")
 app.include_router(trend_router, prefix="/api/v1")
 app.include_router(execution_router, prefix="/api/v1")
 app.include_router(orchestrator_router, prefix="/api/v1")
+app.include_router(optimizer_router, prefix="/api/v1")
 
 # Scoring profiles
 app.include_router(scoring_router, prefix="/api/v1")
