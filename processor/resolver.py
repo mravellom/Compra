@@ -271,7 +271,7 @@ async def batch_resolve(
                     RETURNING id, canonical_name, (xmax = 0) AS was_inserted
                     """,
                     batch_names, batch_brands, batch_models, batch_categories,
-                    [np.asarray(e, dtype=np.float32).flatten() for e in batch_embeddings],
+                    [np.ravel(np.asarray(e, dtype=np.float32)) for e in batch_embeddings],
                 )
 
             # Build lookup by canonical_name
@@ -346,7 +346,7 @@ async def batch_resolve(
                             ON CONFLICT (canonical_name) DO UPDATE SET updated_at = now()
                             RETURNING id, (xmax = 0) AS was_inserted
                             """,
-                            normalized, brand, model, category, np.array(embedding).flatten(),
+                            normalized, brand, model, category, np.ravel(np.asarray(embedding, dtype=np.float32)),
                         )
                     new_id = row["id"]
                     was_inserted = row["was_inserted"]
