@@ -63,9 +63,20 @@ class ExecutionService:
 
         if not assessment.passed:
             logger.warning(
-                "Risk check failed for product=%d: %s",
+                "Risk check BLOCKED order for product=%d: %s",
                 product_id, assessment.reasons,
             )
+            # Risk gate: block the order — do not allow it through approval
+            order.status = OrderStatus.CANCELLED
+            order.approval_state = ApprovalState.REJECTED
+            order.error_message = f"Risk check failed: {'; '.join(assessment.reasons)}"
+
+            order = await self._repo.save_order(order)
+            await self._repo.log_event(
+                order.id, "risk_rejected", None, order.status.value,
+                {"risk_passed": False, "reasons": assessment.reasons},
+            )
+            return order
 
         # Submit through approval workflow
         order = self._approval.submit(order)

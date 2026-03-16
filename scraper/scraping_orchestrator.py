@@ -117,18 +117,13 @@ class ScrapingOrchestrator:
 
         total = 0
 
-        # Run modes sequentially to avoid overwhelming targets
-        # 1. Category crawling (60% of effort)
-        cat_listings = await self._run_category_mode()
-        total += cat_listings
-
-        # 2. Expanded search (25% of effort)
-        search_listings = await self._run_search_mode()
-        total += search_listings
-
-        # 3. Trending discovery (15% of effort)
-        trend_listings = await self._run_trending_mode()
-        total += trend_listings
+        # Run all scraping modes in parallel
+        cat_listings, search_listings, trend_listings = await asyncio.gather(
+            self._run_category_mode(),
+            self._run_search_mode(),
+            self._run_trending_mode(),
+        )
+        total += cat_listings + search_listings + trend_listings
 
         # Recalculate priorities for next cycle
         self._prioritizer.recalculate_priorities()

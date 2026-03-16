@@ -236,16 +236,17 @@ class OrchestratorService:
         self, opportunities: list[OpportunityContext]
     ) -> list[OrchestratorDecision]:
         """Process multiple opportunities sequentially."""
-        decisions: list[OrchestratorDecision] = []
-        for opp in opportunities:
-            try:
-                decision = await self.process_opportunity(opp)
-                decisions.append(decision)
-            except Exception:
-                logger.error(
-                    "Pipeline failed for opportunity %d",
-                    opp.opportunity_id, exc_info=True,
-                )
+        sem = asyncio.Semaphore(5)
+        async def _process_one(opp):
+            async with sem:
+                try:
+                    return await self.process_opportunity(opp)
+                except Exception as e:
+                    logger.error("Orchestrator failed for opp %d: %s", opp.opportunity_id, e)
+                    return None
+
+        raw_results = await asyncio.gather(*[_process_one(opp) for opp in opportunities])
+        decisions = [r for r in raw_results if r is not None]
         return decisions
 
     async def get_pipeline(self, pipeline_id: str) -> Optional[IntelligencePipeline]:

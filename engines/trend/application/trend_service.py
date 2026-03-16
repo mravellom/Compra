@@ -1,4 +1,5 @@
 """Trend detection service — orchestrates strategies, persistence, and events."""
+import asyncio
 import logging
 from typing import Optional
 
@@ -28,14 +29,17 @@ class TrendService:
         product_ids = await self._repo.get_active_product_ids(limit)
         logger.info("Detecting trends for %d products", len(product_ids))
 
-        results: list[ProductTrendResult] = []
-        for pid in product_ids:
-            try:
-                result = await self._detect_single(pid)
-                if result:
-                    results.append(result)
-            except Exception:
-                logger.error("Trend detection failed for product %d", pid, exc_info=True)
+        sem = asyncio.Semaphore(10)
+        async def _detect_one(pid: int):
+            async with sem:
+                try:
+                    return await self._detect_single(pid)
+                except Exception as e:
+                    logger.warning("Trend detection failed for product %d: %s", pid, e)
+                    return None
+
+        raw_results = await asyncio.gather(*[_detect_one(pid) for pid in product_ids])
+        results = [r for r in raw_results if r is not None]
 
         logger.info(
             "Trend detection complete: %d results, %d breakouts",

@@ -59,3 +59,4 @@ class PortfolioSummary(BaseModel):
     total_invested: float = 0.0
     total_profit: float = 0.0
     orders_by_status: dict[str, int] = Field(default_factory=dict)
+    active_opportunity_ids: list[int] = Field(default_factory=list)

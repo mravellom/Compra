@@ -35,29 +35,45 @@ BRAND_MODEL_SIMILARITY_THRESHOLD = float(os.getenv("BRAND_MODEL_THRESHOLD", "0.6
 BRAND_ONLY_SIMILARITY_THRESHOLD = float(os.getenv("BRAND_ONLY_THRESHOLD", "0.75"))
 MATCH_MAX_PRICE_RATIO = float(os.getenv("MATCH_MAX_PRICE_RATIO", "3.5"))
 
-# ── In-memory match cache ────────────────────────────────────
+# ── In-memory match cache (LRU, O(1) eviction) ──────────
 _MATCH_CACHE_SIZE = int(os.getenv("MATCH_CACHE_SIZE", "16384"))
-_match_cache: dict[str, tuple[float, "MatchResult"]] = {}
 _MATCH_CACHE_TTL = 600  # 10 minutes
 
+class _LRUMatchCache:
+    """O(1) LRU cache with TTL, replacing O(n log n) sorted eviction."""
+    __slots__ = ("_data", "_max_size", "_ttl")
 
-def _cache_get(key: str) -> "MatchResult | None":
-    entry = _match_cache.get(key)
-    if entry is None:
-        return None
-    ts, result = entry
-    if time.monotonic() - ts > _MATCH_CACHE_TTL:
-        del _match_cache[key]
-        return None
-    return result
+    def __init__(self, max_size: int, ttl: float):
+        from collections import OrderedDict
+        self._data: OrderedDict[str, tuple[float, "MatchResult"]] = OrderedDict()
+        self._max_size = max_size
+        self._ttl = ttl
 
+    def get(self, key: str) -> "MatchResult | None":
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        ts, result = entry
+        if time.monotonic() - ts > self._ttl:
+            del self._data[key]
+            return None
+        self._data.move_to_end(key)
+        return result
 
-def _cache_put(key: str, result: "MatchResult") -> None:
-    if len(_match_cache) >= _MATCH_CACHE_SIZE:
-        sorted_keys = sorted(_match_cache, key=lambda k: _match_cache[k][0])
-        for k in sorted_keys[: _MATCH_CACHE_SIZE // 4]:
-            del _match_cache[k]
-    _match_cache[key] = (time.monotonic(), result)
+    def put(self, key: str, result: "MatchResult") -> None:
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = (time.monotonic(), result)
+        while len(self._data) > self._max_size:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+_match_cache = _LRUMatchCache(_MATCH_CACHE_SIZE, _MATCH_CACHE_TTL)
 
 
 @dataclass
@@ -142,7 +158,7 @@ async def batch_resolve(
     for i in range(M):
         normalized = normalize_title(titles[i])
         cache_key = f"{normalized}:{prices[i]:.2f}:{currencies[i]}"
-        cached = _cache_get(cache_key)
+        cached = _match_cache.get(cache_key)
         if cached is not None:
             results[i] = cached
             resolver_metrics.cache_hits += 1
@@ -207,7 +223,7 @@ async def batch_resolve(
             )
             results[ui] = result
             cache_key = f"{query_normalized[j]}:{prices[ui]:.2f}:{currencies[ui]}"
-            _cache_put(cache_key, result)
+            _match_cache.put(cache_key, result)
         else:
             # No match — need to create a new product in DB
             new_product_tasks.append((
@@ -295,7 +311,7 @@ async def batch_resolve(
                 )
                 results[ui] = result
                 cache_key = f"{normalized}:{price:.2f}:{currency}"
-                _cache_put(cache_key, result)
+                _match_cache.put(cache_key, result)
 
             # Resolve deferred duplicates (same canonical_name within batch)
             for ui, j, normalized, brand, model, embedding, price, currency, category in deferred_dupes:
@@ -310,7 +326,7 @@ async def batch_resolve(
                 )
                 results[ui] = result
                 cache_key = f"{normalized}:{price:.2f}:{currency}"
-                _cache_put(cache_key, result)
+                _match_cache.put(cache_key, result)
 
             # Batch append to in-memory index
             if new_ids:
@@ -345,7 +361,7 @@ async def batch_resolve(
                     )
                     results[ui] = result
                     cache_key = f"{normalized}:{price:.2f}:{currency}"
-                    _cache_put(cache_key, result)
+                    _match_cache.put(cache_key, result)
                 except Exception:
                     logger.error("Error creating product '%s'", normalized[:50], exc_info=True)
 

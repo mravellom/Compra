@@ -64,16 +64,20 @@ class ApprovalWorkflow:
 
     @staticmethod
     def _meets_auto_approval(order: TradeOrder) -> bool:
-        """Check if order qualifies for automatic approval."""
+        """Check if order qualifies for automatic approval.
+
+        Requires:
+        - total_cost <= AUTO_APPROVE_MAX_COST ($50 default)
+        - risk assessment passed (all guards green)
+        """
         max_auto_cost = float(os.getenv("AUTO_APPROVE_MAX_COST", "50"))
-        min_auto_confidence = float(os.getenv("AUTO_APPROVE_MIN_CONFIDENCE", "0.7"))
 
         if order.total_cost > max_auto_cost:
             return False
 
-        # Check risk assessment confidence if available
+        # Risk assessment must have passed all guards
         risk = order.risk_assessment
-        if isinstance(risk, dict) and risk.get("confidence", 0) < min_auto_confidence:
+        if isinstance(risk, dict) and not risk.get("passed", False):
             return False
 
         return True

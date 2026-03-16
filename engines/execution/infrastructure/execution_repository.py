@@ -155,7 +155,17 @@ class ExecutionRepository:
             status_result = await session.execute(
                 text("SELECT status, COUNT(*) FROM execution_orders GROUP BY status")
             )
-            status_counts = {r[0]: r[1] for r in status_result.fetchall()}
+            status_counts: dict = {r[0]: r[1] for r in status_result.fetchall()}
+
+            # Active opportunity IDs for duplicate detection
+            active_opp_result = await session.execute(
+                text("""
+                    SELECT DISTINCT opportunity_id FROM execution_orders
+                    WHERE opportunity_id IS NOT NULL
+                      AND status IN ('draft','pending_approval','approved','executing')
+                """)
+            )
+            active_opp_ids = [r[0] for r in active_opp_result.fetchall()]
 
             return PortfolioSummary(
                 total_exposure=float(row[0]) if row else 0,
@@ -164,6 +174,7 @@ class ExecutionRepository:
                 total_invested=float(row[3]) if row else 0,
                 total_profit=float(row[4]) if row else 0,
                 orders_by_status=status_counts,
+                active_opportunity_ids=active_opp_ids,
             )
 
     @staticmethod

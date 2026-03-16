@@ -100,15 +100,21 @@ class MinProfitGuard(RiskGuard):
 
 
 class DuplicateGuard(RiskGuard):
-    """Prevents duplicate orders for the same opportunity."""
+    """Prevents duplicate orders for the same opportunity.
+
+    Uses active_opportunity_ids injected into PortfolioSummary.orders_by_status
+    under the key '_active_opportunity_ids' (set by repository).
+    """
 
     @property
     def name(self) -> str:
         return "duplicate_check"
 
     def evaluate(self, order: TradeOrder, portfolio: PortfolioSummary) -> tuple[bool, str]:
-        # This is checked at the repository level; here we do a lightweight check
-        # via the portfolio's existing order IDs (injected as metadata if available)
+        if not order.opportunity_id:
+            return True, ""
+        if order.opportunity_id in portfolio.active_opportunity_ids:
+            return False, f"Active order already exists for opportunity {order.opportunity_id}"
         return True, ""
 
 

@@ -1,4 +1,5 @@
 """Prediction service — orchestrates strategy selection, execution, and persistence."""
+import asyncio
 import logging
 from typing import Optional
 
@@ -94,16 +95,22 @@ class PredictionService:
         model_type: Optional[ModelType] = None,
     ) -> list[PriceForecast]:
         """Generate predictions for multiple products."""
-        results = []
-        for pid in product_ids:
-            try:
-                request = PredictionRequest(
-                    product_id=pid, horizon=horizon, model_type=model_type
-                )
-                forecast = await self.predict(request)
-                results.append(forecast)
-            except Exception:
-                logger.error("Prediction failed for product %d", pid, exc_info=True)
+        sem = asyncio.Semaphore(10)
+        async def _predict_one(pid: int) -> PriceForecast | None:
+            async with sem:
+                try:
+                    request = PredictionRequest(
+                        product_id=pid,
+                        horizon=horizon,
+                        model_type=model_type,
+                    )
+                    return await self.predict(request)
+                except Exception as e:
+                    logger.warning("Prediction failed for product %d: %s", pid, e)
+                    return None
+
+        results_raw = await asyncio.gather(*[_predict_one(pid) for pid in product_ids])
+        results = [r for r in results_raw if r is not None]
         return results
 
     async def get_predictions(

@@ -62,9 +62,10 @@ async def compute_lifecycle_metrics(
     result = await db.execute(
         select(OpportunityHistory)
         .where(OpportunityHistory.master_product_id == opp.master_product_id)
-        .order_by(OpportunityHistory.recorded_at.asc())
+        .order_by(OpportunityHistory.recorded_at.desc())
+        .limit(100)
     )
-    snapshots = list(result.scalars().all())
+    snapshots = list(reversed(result.scalars().all()))
 
     # --- Lifetime: time since first snapshot ---
     if snapshots:

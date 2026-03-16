@@ -6,6 +6,7 @@ can be swapped at runtime via ModelRegistry.
 """
 import logging
 import math
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -293,6 +294,11 @@ class ProphetStrategy(PredictionStrategy):
     Falls back to Baseline if prophet is unavailable.
     """
 
+    # Lazy model cache: product_id -> (model, fitted_at_timestamp)
+    _model_cache: dict[int, tuple] = {}
+    _CACHE_TTL = 3600  # 1 hour
+    _MAX_CACHE_SIZE = 100
+
     @property
     def model_type(self) -> ModelType:
         return ModelType.PROPHET
@@ -330,13 +336,24 @@ class ProphetStrategy(PredictionStrategy):
         _logging.getLogger("prophet").setLevel(_logging.WARNING)
         _logging.getLogger("cmdstanpy").setLevel(_logging.WARNING)
 
-        model = Prophet(
-            yearly_seasonality=False,
-            weekly_seasonality=True if len(df) >= 14 else False,
-            daily_seasonality=False,
-            changepoint_prior_scale=0.05,
-        )
-        model.fit(df)
+        # Try cached model first
+        cached = self._model_cache.get(product_id)
+        if cached is not None and (time.time() - cached[1] < self._CACHE_TTL):
+            model = cached[0]
+        else:
+            model = Prophet(
+                yearly_seasonality=False,
+                weekly_seasonality=True if len(df) >= 14 else False,
+                daily_seasonality=False,
+                changepoint_prior_scale=0.05,
+            )
+            model.fit(df)
+
+            # Cache fitted model
+            if len(self._model_cache) >= self._MAX_CACHE_SIZE:
+                oldest_key = min(self._model_cache, key=lambda k: self._model_cache[k][1])
+                del self._model_cache[oldest_key]
+            self._model_cache[product_id] = (model, time.time())
 
         future = model.make_future_dataframe(periods=horizon.value)
         forecast = model.predict(future)

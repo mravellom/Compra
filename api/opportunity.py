@@ -485,6 +485,100 @@ async def _listing_age(db: AsyncSession, url: str) -> float:
     return max(delta, 1.0)
 
 
+# ── Bulk prefetch for scoring signals (eliminates N+1) ────
+
+async def _prefetch_scoring_data(
+    db: AsyncSession, listings: list,
+) -> tuple[dict[str, list[float]], dict[str, float]]:
+    """Bulk-fetch price histories and listing ages for all URLs in 2 queries.
+
+    Returns:
+        price_histories: url -> list of recent prices (max 20, desc order)
+        listing_ages: url -> age in days (min 1.0)
+    """
+    urls = list({str(l.url) for l in listings})
+    if not urls:
+        return {}, {}
+
+    # Query 1: price histories (all URLs, last 20 per URL)
+    rows = (await db.execute(
+        text("""
+            SELECT listing_url, price::float
+            FROM (
+                SELECT listing_url, price,
+                       ROW_NUMBER() OVER (PARTITION BY listing_url ORDER BY recorded_at DESC) AS rn
+                FROM price_history
+                WHERE listing_url = ANY(:urls)
+            ) sub
+            WHERE rn <= 20
+        """),
+        {"urls": urls},
+    )).all()
+
+    price_histories: dict[str, list[float]] = {}
+    for url, price in rows:
+        price_histories.setdefault(url, []).append(price)
+
+    # Query 2: listing ages (MIN recorded_at per URL)
+    age_rows = (await db.execute(
+        text("""
+            SELECT listing_url, MIN(recorded_at) AS first_seen
+            FROM price_history
+            WHERE listing_url = ANY(:urls)
+            GROUP BY listing_url
+        """),
+        {"urls": urls},
+    )).all()
+
+    now = datetime.now(timezone.utc)
+    listing_ages: dict[str, float] = {}
+    for url, first_seen in age_rows:
+        if first_seen:
+            delta = (now - first_seen).total_seconds() / 86400.0
+            listing_ages[url] = max(delta, 1.0)
+
+    return price_histories, listing_ages
+
+
+def _compute_stability_cached(prices: list[float]) -> float:
+    """Price stability 0-100 from CV, using prefetched prices."""
+    if len(prices) < 2:
+        return 50.0
+    avg = statistics.mean(prices)
+    if avg == 0:
+        return 50.0
+    cv = statistics.stdev(prices) / avg
+    return round(max(0, min(100, (1 - cv / 0.3) * 100)), 1)
+
+
+def _compute_depth_cached(
+    listings: list, competitor_count: int,
+    age_cache: dict[str, float],
+) -> tuple[float, float, float, str]:
+    """Market depth using prefetched listing ages."""
+    if not listings:
+        return 0.0, 0.0, 0.0, "low"
+
+    estimates: list[float] = []
+    for l in listings:
+        age = age_cache.get(str(l.url), 1.0)
+        if l.sales_count and l.sales_count > 0 and age > 0:
+            estimates.append(l.sales_count / age)
+        if l.reviews_count and l.reviews_count > 0 and age > 0:
+            estimates.append((l.reviews_count / 0.03) / max(age, 1))
+
+    multiplier = 1.5 if competitor_count >= 10 else 1.2 if competitor_count >= 5 else 1.0
+    daily = (statistics.median(estimates) * multiplier) if estimates else max(0.1, competitor_count / 3.0)
+    monthly = round(daily * 30, 1)
+    daily = round(daily, 2)
+
+    score = min(100, 20 + 25 * math.log2(daily + 1)) if daily > 0 else 0.0
+    score = round(score, 1)
+
+    level = "high" if score >= 70 else "medium" if score >= 40 else "low"
+    return score, daily, monthly, level
+
+
 # Scoring weights (sum = 1.0)
 W = {"profit": 0.20, "roi": 0.15, "margin": 0.10, "velocity": 0.15,
      "competition": 0.10, "stability": 0.10, "depth": 0.10, "demand": 0.10}
@@ -625,6 +719,9 @@ async def _analyze_product(
         logger.debug("[scan] product %d: only %d after outlier removal, skip", product_id, len(trusted))
         return None
 
+    # Prefetch scoring data in 2 bulk queries (eliminates N+1)
+    price_cache, age_cache = await _prefetch_scoring_data(db, trusted)
+
     # Group by marketplace
     by_mp: dict[str, list[ProductListing]] = {}
     for l in trusted:
@@ -743,12 +840,14 @@ async def _analyze_product(
             if comp.competitor_count > 20:
                 soft_penalty += 10
 
-            # Scoring signals
-            stability = await compute_stability(db, sell_candidate.url)
-            depth_score, daily_sales, monthly_sales, scalability = await compute_depth(
-                db, sell_listings, comp.competitor_count
+            # Scoring signals (from prefetched cache — zero queries)
+            stability = _compute_stability_cached(
+                price_cache.get(str(sell_candidate.url), [])
             )
-            listing_age = await _listing_age(db, sell_candidate.url)
+            depth_score, daily_sales, monthly_sales, scalability = _compute_depth_cached(
+                sell_listings, comp.competitor_count, age_cache,
+            )
+            listing_age = age_cache.get(str(sell_candidate.url), 1.0)
 
             # Compute price spread across sell listings
             sell_prices = [to_usd(float(l.price), l.currency, rates) for l in sell_listings]

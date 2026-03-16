@@ -24,10 +24,10 @@ class RateLimiter:
         self._burst = burst
         self._tokens: dict[str, float] = defaultdict(lambda: float(burst))
         self._last_refill: dict[str, float] = defaultdict(time.monotonic)
-        self._lock = asyncio.Lock()
+        self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     async def acquire(self, domain: str = "default") -> None:
-        async with self._lock:
+        async with self._locks[domain]:
             now = time.monotonic()
             elapsed = now - self._last_refill[domain]
             self._tokens[domain] = min(

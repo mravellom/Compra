@@ -62,29 +62,23 @@ class DedupFilter:
             new_hashes.append(h)
             unique.append(listing)
 
-        # Check and add to Redis if available
+        # Check and add to Redis in a single pipeline (1 RTT instead of 2)
         if self._redis and new_hashes:
             try:
                 pipe = self._redis.pipeline()
+                # Interleave SISMEMBER + SADD in one pipeline
                 for h in new_hashes:
                     pipe.sismember(DEDUP_KEY, h)
+                    pipe.sadd(DEDUP_KEY, h)
+                pipe.expire(DEDUP_KEY, DEDUP_TTL_SECONDS)
                 results = await pipe.execute()
 
-                # Filter out any that Redis already has
+                # Results alternate: [sismember_0, sadd_0, sismember_1, sadd_1, ..., expire]
                 filtered = []
-                redis_new = []
-                for listing, h, already_seen in zip(unique, new_hashes, results):
+                for i, (listing, h) in enumerate(zip(unique, new_hashes)):
+                    already_seen = results[i * 2]  # sismember result
                     if not already_seen:
                         filtered.append(listing)
-                        redis_new.append(h)
-
-                # Add new hashes to Redis
-                if redis_new:
-                    pipe = self._redis.pipeline()
-                    for h in redis_new:
-                        pipe.sadd(DEDUP_KEY, h)
-                    pipe.expire(DEDUP_KEY, DEDUP_TTL_SECONDS)
-                    await pipe.execute()
 
                 unique = filtered
             except Exception:

@@ -55,6 +55,14 @@ class ProductIndex:
         self._last_refresh = 0.0
         self._product_count = 0
 
+        # Hierarchical indexes for O(1) candidate lookup
+        self._brand_model_idx: dict[tuple[str, str], list[int]] = {}  # (brand, model) -> [indices]
+        self._brand_idx: dict[str, list[int]] = {}                     # brand -> [indices]
+
+        # Append buffer — avoids per-item vstack
+        self._append_buffer: list[tuple[int, str, str | None, str | None, str | None, list[float]]] = []
+        self._APPEND_BUFFER_SIZE = 50
+
     @property
     def size(self) -> int:
         return self._product_count
@@ -64,106 +72,102 @@ class ProductIndex:
         return self._loaded
 
     async def load(self, pool) -> None:
-        """Load all master products from DB into memory."""
-        async with self._lock:
-            t0 = time.monotonic()
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT id, canonical_name, brand, model, category,
-                           COALESCE(median_price_usd, 0)::float AS median_price_usd,
-                           COALESCE(listing_price_count, 0) AS listing_price_count,
-                           embedding::float4[]
-                    FROM master_products
-                    ORDER BY id
-                    """
-                )
+        """Load all master products from DB into memory (copy-on-write)."""
+        t0 = time.monotonic()
 
-            if not rows:
+        # Phase 1: Fetch data OUTSIDE the lock (DB I/O, ~300ms)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, canonical_name, brand, model, category,
+                       COALESCE(median_price_usd, 0)::float AS median_price_usd,
+                       COALESCE(listing_price_count, 0) AS listing_price_count,
+                       embedding::float4[]
+                FROM master_products
+                ORDER BY id
+                """
+            )
+
+        if not rows:
+            async with self._lock:
                 self._embeddings = np.empty((0, 384), dtype=np.float32)
                 self._products = []
                 self._id_to_idx = {}
                 self._product_count = 0
+                self._brand_model_idx = {}
+                self._brand_idx = {}
                 self._loaded = True
                 self._last_refresh = time.monotonic()
-                return
+            return
 
-            from .normalizer import get_product_type
+        # Phase 2: Build new structures OUTSIDE the lock (CPU, ~200ms)
+        from .normalizer import get_product_type
 
-            products = []
-            embeddings = []
-            id_to_idx = {}
+        products = []
+        embeddings = []
+        id_to_idx = {}
 
-            for i, row in enumerate(rows):
-                meta = ProductMeta(
-                    id=row["id"],
-                    canonical_name=row["canonical_name"],
-                    brand=row["brand"],
-                    model=row["model"],
-                    category=row["category"],
-                    median_price_usd=row["median_price_usd"],
-                    listing_price_count=row["listing_price_count"],
-                    product_type=get_product_type(row["canonical_name"]),
-                )
-                products.append(meta)
-                embeddings.append(row["embedding"])
-                id_to_idx[row["id"]] = i
+        for i, row in enumerate(rows):
+            meta = ProductMeta(
+                id=row["id"],
+                canonical_name=row["canonical_name"],
+                brand=row["brand"],
+                model=row["model"],
+                category=row["category"],
+                median_price_usd=row["median_price_usd"],
+                listing_price_count=row["listing_price_count"],
+                product_type=get_product_type(row["canonical_name"]),
+            )
+            products.append(meta)
+            embeddings.append(row["embedding"])
+            id_to_idx[row["id"]] = i
 
-            emb_matrix = np.array(embeddings, dtype=np.float32)
-            # Normalize rows for cosine similarity via dot product
-            norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1, norms)
-            emb_matrix = emb_matrix / norms
+        emb_matrix = np.array(embeddings, dtype=np.float32)
+        norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        emb_matrix = emb_matrix / norms
 
+        # Build hierarchical indexes
+        brand_model_idx: dict[tuple[str, str], list[int]] = {}
+        brand_idx: dict[str, list[int]] = {}
+        for i, p in enumerate(products):
+            if p.brand:
+                brand_idx.setdefault(p.brand, []).append(i)
+                if p.model:
+                    brand_model_idx.setdefault((p.brand, p.model), []).append(i)
+
+        # Phase 3: Atomic swap UNDER lock (<1ms)
+        async with self._lock:
             self._embeddings = emb_matrix
             self._products = products
             self._id_to_idx = id_to_idx
             self._product_count = len(products)
+            self._brand_model_idx = brand_model_idx
+            self._brand_idx = brand_idx
             self._loaded = True
             self._last_refresh = time.monotonic()
 
-            elapsed = time.monotonic() - t0
-            mem_mb = emb_matrix.nbytes / 1024 / 1024
-            logger.info(
-                "Product index loaded: %d products, %.1f MB, %.1fs",
-                len(products), mem_mb, elapsed,
-            )
+        elapsed = time.monotonic() - t0
+        mem_mb = emb_matrix.nbytes / 1024 / 1024
+        logger.info(
+            "Product index loaded: %d products, %.1f MB, %.1fs",
+            len(products), mem_mb, elapsed,
+        )
 
     def append(self, product_id: int, canonical_name: str, brand: str | None,
                model: str | None, category: str | None, embedding: list[float]) -> None:
-        """Append a newly created product to the index (no lock needed, atomic swap)."""
-        from .normalizer import get_product_type
+        """Buffer a new product for batch append (avoids per-item vstack)."""
+        self._append_buffer.append((product_id, canonical_name, brand, model, category, embedding))
+        if len(self._append_buffer) >= self._APPEND_BUFFER_SIZE:
+            self._flush_append_buffer()
 
-        meta = ProductMeta(
-            id=product_id,
-            canonical_name=canonical_name,
-            brand=brand,
-            model=model,
-            category=category,
-            median_price_usd=0.0,
-            listing_price_count=0,
-            product_type=get_product_type(canonical_name),
-        )
-
-        emb = np.array(embedding, dtype=np.float32)
-        norm = np.linalg.norm(emb)
-        if norm > 0:
-            emb = emb / norm
-
-        # Atomic append: create new arrays, then swap references
-        if self._embeddings is not None and len(self._embeddings) > 0:
-            new_embeddings = np.vstack([self._embeddings, emb.reshape(1, -1)])
-        else:
-            new_embeddings = emb.reshape(1, -1)
-
-        new_products = self._products + [meta]
-        new_id_to_idx = {**self._id_to_idx, product_id: len(self._products)}
-
-        # Atomic swap
-        self._embeddings = new_embeddings
-        self._products = new_products
-        self._id_to_idx = new_id_to_idx
-        self._product_count = len(new_products)
+    def _flush_append_buffer(self) -> None:
+        """Flush buffered appends as a single batch vstack."""
+        if not self._append_buffer:
+            return
+        pids, names, brands, models, cats, embs = zip(*self._append_buffer)
+        self.append_batch(list(pids), list(names), list(brands), list(models), list(cats), list(embs))
+        self._append_buffer.clear()
 
     def append_batch(self, product_ids: list[int], canonical_names: list[str],
                      brands: list[str | None], models: list[str | None],
@@ -208,6 +212,19 @@ class ProductIndex:
         self._products = new_products
         self._id_to_idx = new_id_to_idx
         self._product_count = len(new_products)
+        self._rebuild_hierarchical_index()
+
+    def _rebuild_hierarchical_index(self) -> None:
+        """Build brand/model lookup indexes for O(1) candidate filtering."""
+        brand_model_idx: dict[tuple[str, str], list[int]] = {}
+        brand_idx: dict[str, list[int]] = {}
+        for i, p in enumerate(self._products):
+            if p.brand:
+                brand_idx.setdefault(p.brand, []).append(i)
+                if p.model:
+                    brand_model_idx.setdefault((p.brand, p.model), []).append(i)
+        self._brand_model_idx = brand_model_idx
+        self._brand_idx = brand_idx
 
     def needs_refresh(self) -> bool:
         return (time.monotonic() - self._last_refresh) > REFRESH_INTERVAL
@@ -253,6 +270,10 @@ class ProductIndex:
                c) global match → threshold 0.82
             3. Apply product_type and price compatibility guards
         """
+        # Flush any buffered appends before searching
+        if self._append_buffer:
+            self._flush_append_buffer()
+
         if self._product_count == 0 or self._embeddings is None:
             return [None] * len(brands)
 
@@ -310,17 +331,15 @@ class ProductIndex:
         global_threshold: float,
         max_price_ratio: float,
     ) -> "ProductIndex.SearchResult | None":
-        """Find the best match for a single query across all 3 levels."""
-        N = len(sims)
+        """Find best match using hierarchical index for O(K) instead of O(N)."""
 
-        # Level 1: brand + model exact match
+        # Level 1: brand + model exact match — O(K) where K << N
         if q_brand and q_model:
+            candidates = self._brand_model_idx.get((q_brand, q_model), [])
             best_sim = -1.0
             best_idx = -1
-            for j in range(N):
-                if (p_brands[j] == q_brand
-                        and p_models[j] == q_model
-                        and sims[j] > best_sim
+            for j in candidates:
+                if (sims[j] > best_sim
                         and sims[j] >= brand_model_threshold
                         and p_types[j] == q_type
                         and self._price_ok(q_price, p_medians[j], p_counts[j], max_price_ratio)):
@@ -333,13 +352,13 @@ class ProductIndex:
                     similarity=float(best_sim),
                 )
 
-        # Level 2: brand-only match (exclude different models)
+        # Level 2: brand-only match — O(K) where K = products of same brand
         if q_brand:
+            candidates = self._brand_idx.get(q_brand, [])
             best_sim = -1.0
             best_idx = -1
-            for j in range(N):
-                if (p_brands[j] == q_brand
-                        and (p_models[j] is None or p_models[j] == q_model or q_model is None)
+            for j in candidates:
+                if ((p_models[j] is None or p_models[j] == q_model or q_model is None)
                         and sims[j] > best_sim
                         and sims[j] >= brand_only_threshold
                         and p_types[j] == q_type
@@ -353,7 +372,7 @@ class ProductIndex:
                     similarity=float(best_sim),
                 )
 
-        # Level 3: global embedding match (strict)
+        # Level 3: global embedding match (strict) — O(1) via argmax
         best_idx_global = int(np.argmax(sims))
         best_sim_global = float(sims[best_idx_global])
         if (best_sim_global >= global_threshold

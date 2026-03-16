@@ -14,6 +14,8 @@ from .routes.alerts import router as alerts_router
 from .routes.categories import router as categories_router
 from .routes.discovery import router as discovery_router
 from .routes.opportunities import router as opportunities_router
+from .routes.monetization import router as monetization_router, init_monetization, get_health_monitor
+from .routes.scoring import router as scoring_router
 
 # Engine routers
 from engines.prediction.api.routes import router as prediction_router
@@ -49,10 +51,25 @@ async def _auto_scan_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_auto_scan_loop())
+    # Initialize monetization publisher
+    publisher = init_monetization()
+    logger.info("Monetization publisher initialized with %d channels", len(publisher.channels))
+
+    # Start health monitor
+    health_monitor = get_health_monitor()
+    monitor_task = None
+    if health_monitor:
+        monitor_task = asyncio.create_task(health_monitor.start())
+        logger.info("Health monitor started")
+
+    scan_task = asyncio.create_task(_auto_scan_loop())
     logger.info("Auto-scan started (every %ds)", SCAN_INTERVAL)
     yield
-    task.cancel()
+    scan_task.cancel()
+    if monitor_task:
+        if health_monitor:
+            await health_monitor.stop()
+        monitor_task.cancel()
 
 
 app = FastAPI(
@@ -88,6 +105,12 @@ app.include_router(prediction_router, prefix="/api/v1")
 app.include_router(trend_router, prefix="/api/v1")
 app.include_router(execution_router, prefix="/api/v1")
 app.include_router(orchestrator_router, prefix="/api/v1")
+
+# Scoring profiles
+app.include_router(scoring_router, prefix="/api/v1")
+
+# Monetization & observability
+app.include_router(monetization_router)
 
 
 @app.get("/health")
