@@ -65,7 +65,7 @@ class ProductIndex:
 
     @property
     def size(self) -> int:
-        return self._product_count
+        return self._product_count + len(self._append_buffer)
 
     @property
     def is_loaded(self) -> bool:

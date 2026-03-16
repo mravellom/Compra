@@ -61,6 +61,8 @@ def build_index(products: list[tuple]) -> ProductIndex:
     index = ProductIndex()
     for pid, name, brand, model, emb in products:
         index.append(pid, name, brand, model, None, emb)
+    # Flush buffer immediately so products are in the numpy arrays
+    index._flush_append_buffer()
     index._loaded = True
     return index
 
@@ -101,26 +103,30 @@ def _patch_resolver(mocker, index, mock_db_rows=None):
         return FAKE_RATES
     mocker.patch("processor.resolver.get_rates", side_effect=fake_rates)
 
-    if mock_db_rows is not None:
-        mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=mock_db_rows)
+    # Always mock get_pool to prevent real DB access.
+    # When mock_db_rows is None, the mock returns empty rows (fallback safe).
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=mock_db_rows or [])
+    mock_conn.fetchrow = AsyncMock(return_value=None)
 
-        pool = MagicMock()
-        pool.acquire.return_value = _FakeAcquire(mock_conn)
+    pool = MagicMock()
+    pool.acquire.return_value = _FakeAcquire(mock_conn)
 
-        async def fake_get_pool():
-            return pool
-        mocker.patch("processor.resolver.get_pool", side_effect=fake_get_pool)
+    async def fake_get_pool():
+        return pool
+    mocker.patch("processor.resolver.get_pool", side_effect=fake_get_pool)
 
-        return mock_conn
-
-    return None
+    return mock_conn if mock_db_rows is not None else None
 
 
 @pytest.fixture(autouse=True)
-def clear_cache():
-    """Clear resolver match cache before/after each test."""
+def clear_cache(monkeypatch):
+    """Clear resolver match cache and pin similarity threshold."""
     _match_cache.clear()
+    # Pin thresholds to defaults — .env may override via load_dotenv()
+    monkeypatch.setattr("processor.resolver.SIMILARITY_THRESHOLD", 0.82)
+    monkeypatch.setattr("processor.resolver.BRAND_MODEL_SIMILARITY_THRESHOLD", 0.60)
+    monkeypatch.setattr("processor.resolver.BRAND_ONLY_SIMILARITY_THRESHOLD", 0.75)
     yield
     _match_cache.clear()
 
@@ -212,6 +218,7 @@ class TestResolverMatching:
         index = build_index([
             (3, "generic headphones model z", None, None, base_emb),
         ])
+
         _patch_resolver(mocker, index)
 
         results = await batch_resolve(
@@ -221,7 +228,7 @@ class TestResolverMatching:
             currencies=["USD"],
         )
 
-        assert results[0].is_new is False
+        assert results[0].is_new is False, f"Expected is_new=False, got result: {results[0]}"
         assert results[0].master_product_id == 3
         assert results[0].similarity >= 0.82
 
