@@ -148,3 +148,26 @@ def make_scoring_input(**overrides):
     )
     defaults.update(overrides)
     return ScoringInput(**defaults)
+
+
+# ── OpportunitySnapshot Factory ──────────────────────────────
+
+
+def make_opportunity_snapshot(**overrides):
+    from api.opportunity_filters import OpportunitySnapshot
+    defaults = dict(
+        confidence_score=90.0,
+        net_profit_usd=45.0,
+        roi=0.35,
+        buy_seller_rating=4.5,
+        sell_seller_rating=4.3,
+        buy_reviews_count=80,
+        sell_reviews_count=60,
+        estimated_monthly_sales=12.0,
+        price_spread_pct=0.05,
+        listing_created_at=None,
+        adjusted_profit_usd=None,
+        adjusted_roi=None,
+    )
+    defaults.update(overrides)
+    return OpportunitySnapshot(**defaults)

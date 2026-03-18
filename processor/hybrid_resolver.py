@@ -336,11 +336,17 @@ def hybrid_match(
     listing: ListingInput,
     candidates: list[MatchCandidate],
     min_confidence: float = 0.45,
+    strict: bool = False,
 ) -> MatchCandidate | None:
     """
     Run all candidates through the hybrid resolver chain.
     Returns the best match above min_confidence, or None.
+
+    If strict=True, delegates to strict_hybrid_match for high-precision mode.
     """
+    if strict:
+        return strict_hybrid_match(listing, candidates)
+
     chain = build_resolver_chain()
     best: MatchCandidate | None = None
     best_conf = 0.0
@@ -363,5 +369,151 @@ def hybrid_match(
             best_conf,
             len(best.signals),
         )
+
+    return best
+
+
+# ══════════════════════════════════════════════════════════════
+# Strict Match Mode (hardened pipeline)
+# ══════════════════════════════════════════════════════════════
+
+
+@dataclass
+class StrictMatchConfig:
+    """Configuration for high-precision matching."""
+    require_brand_exact: bool = True
+    require_model_exact: bool = True
+    reject_accessories: bool = True
+    semantic_max_weight: float = 0.20
+    min_confidence: float = 0.70
+
+
+REJECT_TITLE_KEYWORDS: tuple[str, ...] = (
+    # Bundles & combos
+    "bundle", "kit", "pack", "combo", "set", "lote",
+    # Compatibility markers
+    "compatible", "for ", "para ",
+    # Accessories
+    "funda", "case", "cover", "cable", "cargador", "charger",
+    "protector", "strap", "correa", "band", "mount", "soporte",
+    "adapter", "adaptador", "holder", "bracket", "film", "mica",
+    "glass", "vidrio", "skin", "pouch", "estuche", "bolsa",
+    "replacement", "repuesto", "reemplazo", "tip", "punta",
+)
+
+
+class StrictTitleFilter(ProductMatcher):
+    """Front-of-chain filter that rejects listings with accessory/bundle keywords."""
+
+    def _match(self, listing: ListingInput, candidate: MatchCandidate) -> MatchSignal:
+        title_lower = listing.normalized_title.lower()
+        for kw in REJECT_TITLE_KEYWORDS:
+            if kw in title_lower:
+                return MatchSignal(
+                    MatchVerdict.REJECT, 0.0,
+                    f"title contains reject keyword: '{kw}'",
+                    "StrictTitleFilter",
+                )
+        return MatchSignal(MatchVerdict.PASS, 0.0, "title clean", "StrictTitleFilter")
+
+
+def build_strict_resolver_chain(semantic_threshold: float = 0.88) -> ProductMatcher:
+    """Build a strict chain: TitleFilter → Brand → Model → Attribute → Semantic(0.88)."""
+    title_filter = StrictTitleFilter()
+    brand = BrandMatcher()
+    model = ModelMatcher()
+    attr = AttributeMatcher()
+    semantic = SemanticMatcher(threshold=semantic_threshold)
+
+    title_filter.set_next(brand)
+    brand.set_next(model)
+    model.set_next(attr)
+    attr.set_next(semantic)
+
+    return title_filter
+
+
+def strict_hybrid_match(
+    listing: ListingInput,
+    candidates: list[MatchCandidate],
+    config: StrictMatchConfig | None = None,
+) -> MatchCandidate | None:
+    """High-precision matching with post-validation.
+
+    Post-validates:
+    - Requires ACCEPT from both Brand AND Model (not just one)
+    - Caps semantic-only confidence at semantic_max_weight
+    - Applies min_confidence threshold
+    - Logs structured DEBUG trace for every decision
+    """
+    cfg = config or StrictMatchConfig()
+    chain = build_strict_resolver_chain()
+    best: MatchCandidate | None = None
+    best_conf = 0.0
+
+    for candidate in candidates:
+        candidate.signals = []
+        chain.evaluate(listing, candidate)
+
+        # Post-validation: require both brand and model ACCEPT
+        signal_map = {s.matcher_name: s for s in candidate.signals}
+
+        brand_signal = signal_map.get("BrandMatcher")
+        model_signal = signal_map.get("ModelMatcher")
+
+        brand_accepted = brand_signal and brand_signal.verdict == MatchVerdict.ACCEPT
+        model_accepted = model_signal and model_signal.verdict == MatchVerdict.ACCEPT
+
+        if cfg.require_brand_exact and not brand_accepted:
+            logger.debug(
+                "[strict] REJECT %s → %s: brand not confirmed (%s)",
+                listing.normalized_title[:40],
+                candidate.canonical_name[:40],
+                brand_signal.reason if brand_signal else "missing",
+            )
+            continue
+
+        if cfg.require_model_exact and not model_accepted:
+            logger.debug(
+                "[strict] REJECT %s → %s: model not confirmed (%s)",
+                listing.normalized_title[:40],
+                candidate.canonical_name[:40],
+                model_signal.reason if model_signal else "missing",
+            )
+            continue
+
+        # Cap semantic-only confidence
+        conf = candidate.composite_confidence
+        has_structural_accept = brand_accepted or model_accepted
+        semantic_signal = signal_map.get("SemanticMatcher")
+        semantic_only = (
+            not has_structural_accept
+            and semantic_signal
+            and semantic_signal.verdict == MatchVerdict.ACCEPT
+        )
+        if semantic_only:
+            conf = min(conf, cfg.semantic_max_weight)
+
+        if conf < cfg.min_confidence:
+            logger.debug(
+                "[strict] REJECT %s → %s: confidence %.2f < %.2f",
+                listing.normalized_title[:40],
+                candidate.canonical_name[:40],
+                conf, cfg.min_confidence,
+            )
+            continue
+
+        logger.debug(
+            "[strict] ACCEPT %s → %s (conf=%.2f, brand=%s, model=%s)",
+            listing.normalized_title[:40],
+            candidate.canonical_name[:40],
+            conf,
+            "Y" if brand_accepted else "N",
+            "Y" if model_accepted else "N",
+        )
+
+        if conf > best_conf:
+            best = candidate
+            best_conf = conf
 
     return best

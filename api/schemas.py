@@ -72,6 +72,17 @@ class OpportunityOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class HardenedOpportunityOut(OpportunityOut):
+    """Extended output with hardened pipeline validation data."""
+    is_valid: bool = True
+    rejection_reasons: list[str] = Field(default_factory=list)
+    adjusted_profit: Optional[float] = None
+    adjusted_roi: Optional[float] = None
+    adjusted_margin: Optional[float] = None
+    liquidity_score: float = 0
+    passed_filters: dict[str, bool] = Field(default_factory=dict)
+
+
 class OpportunityFilters(BaseModel):
     min_roi: Optional[float] = Field(None, description="ROI minimo (0.20 = 20%)")
     max_buy_price: Optional[float] = None

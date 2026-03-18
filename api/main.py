@@ -16,6 +16,7 @@ from .routes.discovery import router as discovery_router
 from .routes.opportunities import router as opportunities_router
 from .routes.monetization import router as monetization_router, init_monetization, get_health_monitor
 from .routes.scoring import router as scoring_router
+from .routes.truth import router as truth_router
 
 # Engine routers
 from engines.prediction.api.routes import router as prediction_router
@@ -23,6 +24,8 @@ from engines.trend.api.routes import router as trend_router
 from engines.execution.api.routes import router as execution_router
 from engines.orchestrator.api.routes import router as orchestrator_router
 from engines.portfolio_optimizer.api.routes import router as optimizer_router
+from capital_management.api import router as capital_router
+from execution_realism.api import router as realism_router
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -110,6 +113,15 @@ app.include_router(optimizer_router, prefix="/api/v1")
 
 # Scoring profiles
 app.include_router(scoring_router, prefix="/api/v1")
+
+# Truth engine & observability
+app.include_router(truth_router, prefix="/api/v1")
+
+# Capital management
+app.include_router(capital_router, prefix="/api/v1")
+
+# Execution realism
+app.include_router(realism_router, prefix="/api/v1")
 
 # Monetization & observability
 app.include_router(monetization_router)

@@ -57,6 +57,8 @@ from .scoring import ScoringInput, score as score_opportunity_v2
 
 logger = logging.getLogger(__name__)
 
+HARDENED_MODE = os.getenv("HARDENED_MODE", "false").lower() in ("true", "1", "yes")
+
 
 import re as _re
 
@@ -165,6 +167,93 @@ class ProfitCalc:
     net_profit: float
     roi: float
     margin: float  # net_profit / sell_price
+
+
+# ── Conservative Profit Calculation (hardened mode) ──────
+@dataclass
+class ConservativeProfitConfig:
+    """Aggressive safety margins for high-precision arbitrage."""
+    safety_multiplier: float = 0.70          # Apply 30% haircut to net profit
+    hidden_cost_buffer_pct: float = 0.05     # 5% buffer on buy price
+    use_min_competitor_price: bool = True     # Use MIN (not median) sell price
+    min_adjusted_profit_usd: float = 20.0    # Minimum viable profit after adjustments
+    min_adjusted_roi: float = 0.15           # 15% minimum ROI
+
+
+@dataclass
+class ConservativeProfitCalc:
+    """Wraps original ProfitCalc with conservative adjustments."""
+    original: ProfitCalc
+    adjusted_buy_price: float
+    adjusted_sell_price: float
+    adjusted_net_profit: float
+    adjusted_roi: float
+    adjusted_margin: float
+    is_viable: bool
+    rejection_reason: str | None
+    probability_of_sale: float = 0.0
+    expected_value: float = 0.0
+
+
+def calculate_conservative_profit(
+    original_calc: ProfitCalc,
+    min_competitor_price_usd: float | None = None,
+    config: ConservativeProfitConfig | None = None,
+    probability_of_sale: float = 0.0,
+) -> ConservativeProfitCalc:
+    """Conservative profit recalculation that prioritizes precision over recall.
+
+    1. Adds hidden_cost_buffer_pct to buy price
+    2. Uses min competitor price (if available) instead of median sell price
+    3. Applies safety_multiplier haircut to net profit
+    4. Computes expected_value = adjusted_profit * probability_of_sale
+    5. Rejects if adjusted profit < threshold or adjusted ROI < threshold
+    """
+    cfg = config or ConservativeProfitConfig()
+
+    # Inflate buy price by hidden cost buffer
+    adjusted_buy = original_calc.buy_price_usd * (1 + cfg.hidden_cost_buffer_pct)
+
+    # Use minimum competitor price if configured and available
+    if cfg.use_min_competitor_price and min_competitor_price_usd is not None:
+        adjusted_sell = min(original_calc.sell_price_usd, min_competitor_price_usd)
+    else:
+        adjusted_sell = original_calc.sell_price_usd
+
+    # Recalculate profit with adjusted prices
+    raw_profit = adjusted_sell - adjusted_buy - original_calc.total_fees
+
+    # Apply safety multiplier (30% haircut)
+    adjusted_profit = raw_profit * cfg.safety_multiplier
+    adjusted_roi = adjusted_profit / adjusted_buy if adjusted_buy > 0 else 0.0
+    adjusted_margin = adjusted_profit / adjusted_sell if adjusted_sell > 0 else 0.0
+
+    # Viability check
+    rejection_reason = None
+    if adjusted_profit < cfg.min_adjusted_profit_usd:
+        rejection_reason = (
+            f"adjusted_profit ${adjusted_profit:.2f} < ${cfg.min_adjusted_profit_usd:.2f}"
+        )
+    elif adjusted_roi < cfg.min_adjusted_roi:
+        rejection_reason = (
+            f"adjusted_roi {adjusted_roi:.1%} < {cfg.min_adjusted_roi:.0%}"
+        )
+
+    # Expected value = profit * probability of sale
+    expected_value = adjusted_profit * probability_of_sale if probability_of_sale > 0 else 0.0
+
+    return ConservativeProfitCalc(
+        original=original_calc,
+        adjusted_buy_price=round(adjusted_buy, 2),
+        adjusted_sell_price=round(adjusted_sell, 2),
+        adjusted_net_profit=round(adjusted_profit, 2),
+        adjusted_roi=round(adjusted_roi, 4),
+        adjusted_margin=round(adjusted_margin, 4),
+        is_viable=rejection_reason is None,
+        rejection_reason=rejection_reason,
+        probability_of_sale=round(probability_of_sale, 4),
+        expected_value=round(expected_value, 2),
+    )
 
 
 @dataclass
@@ -799,6 +888,19 @@ async def _analyze_product(
                 continue
             if calc.roi < MIN_ROI:
                 continue
+
+            # ── Hardened mode: conservative profit check ──────
+            if HARDENED_MODE:
+                conservative = calculate_conservative_profit(
+                    calc,
+                    min_competitor_price_usd=comp.lowest_price_usd,
+                )
+                if not conservative.is_viable:
+                    logger.debug(
+                        "[hardened] product %d %s→%s rejected: %s",
+                        product_id, buy_mp, sell_mp, conservative.rejection_reason,
+                    )
+                    continue
 
             price_ratio = sell_usd / buy_usd if buy_usd > 0 else float("inf")
             if price_ratio > MAX_PRICE_RATIO:

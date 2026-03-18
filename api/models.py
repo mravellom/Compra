@@ -273,6 +273,47 @@ class ExecutionLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# ============================================================
+# Truth Engine — Trade Outcomes
+# ============================================================
+
+class TradeOutcome(Base):
+    __tablename__ = "trade_outcomes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    opportunity_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("opportunities.id"), nullable=False)
+    master_product_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("master_products.id"))
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Predicted values
+    buy_price_predicted: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    sell_price_predicted: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    estimated_profit: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    expected_roi: Mapped[float] = mapped_column(REAL, default=0)
+
+    # Actual values
+    buy_price_actual: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    sell_price_actual: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    actual_profit: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    actual_roi: Mapped[float] = mapped_column(REAL, default=0)
+
+    # Time tracking
+    time_to_sell_minutes: Mapped[float | None] = mapped_column(REAL)
+
+    # Status
+    sold: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+
+    # Route
+    buy_marketplace: Mapped[str] = mapped_column(Text, default="")
+    sell_marketplace: Mapped[str] = mapped_column(Text, default="")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AlertConfig(Base):
     __tablename__ = "alert_configs"
 
