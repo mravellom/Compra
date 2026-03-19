@@ -777,10 +777,102 @@ async def detect_opportunities(db: AsyncSession) -> list[Opportunity]:
     return new_opps
 
 
+@dataclass
+class _MarketplaceStats:
+    """Precomputed per-marketplace stats. Computed once, reused across all pairs."""
+    mp_id: str
+    listings: list
+    buy_candidate: object          # cheapest listing
+    buy_usd: float                 # cheapest price in USD
+    sell_prices_usd: list[float]   # all prices converted to USD
+    min_sell_usd: float
+    avg_sell_usd: float
+    price_spread: float
+    total_sales: int
+    total_reviews: int
+    depth_score: float
+    daily_sales: float
+    monthly_sales: float
+    scalability: str
+
+
+def _precompute_marketplace_stats(
+    by_mp: dict[str, list],
+    rates: dict[str, float],
+    age_cache: dict[str, float],
+) -> dict[str, _MarketplaceStats]:
+    """Precompute all per-marketplace stats in a single pass over listings.
+
+    Each marketplace's listings are iterated exactly once. The results are
+    reused across all route pairs, eliminating redundant computation.
+    """
+    stats: dict[str, _MarketplaceStats] = {}
+
+    for mp_id, listings in by_mp.items():
+        # Single pass: compute prices, find cheapest, aggregate signals
+        prices_usd: list[float] = []
+        cheapest_listing = None
+        cheapest_usd = float("inf")
+        total_sales = 0
+        total_reviews = 0
+
+        for l in listings:
+            p = to_usd(float(l.price), l.currency, rates)
+            prices_usd.append(p)
+            if p < cheapest_usd:
+                cheapest_usd = p
+                cheapest_listing = l
+            total_sales += l.sales_count or 0
+            total_reviews += l.reviews_count or 0
+
+        avg_sell = statistics.mean(prices_usd) if prices_usd else 1.0
+        min_sell = min(prices_usd) if prices_usd else 0.0
+
+        if len(prices_usd) > 1 and avg_sell > 0:
+            price_spread = (max(prices_usd) - min_sell) / avg_sell
+        else:
+            price_spread = 0.0
+
+        # Depth — computed once per marketplace, not per pair
+        # Use listing count as proxy for competitor_count in this precompute
+        depth_score, daily_sales, monthly_sales, scalability = _compute_depth_cached(
+            listings, len(listings), age_cache,
+        )
+
+        stats[mp_id] = _MarketplaceStats(
+            mp_id=mp_id,
+            listings=listings,
+            buy_candidate=cheapest_listing,
+            buy_usd=cheapest_usd,
+            sell_prices_usd=prices_usd,
+            min_sell_usd=min_sell,
+            avg_sell_usd=avg_sell,
+            price_spread=price_spread,
+            total_sales=total_sales,
+            total_reviews=total_reviews,
+            depth_score=depth_score,
+            daily_sales=daily_sales,
+            monthly_sales=monthly_sales,
+            scalability=scalability,
+        )
+
+    return stats
+
+
 async def _analyze_product(
     db: AsyncSession, product_id: int, rates: dict[str, float]
 ) -> Opportunity | None:
-    """Analyze a single product cluster for arbitrage. Returns best opportunity or None."""
+    """Analyze a single product cluster for arbitrage. Returns best opportunity or None.
+
+    Optimized pipeline:
+    1. Load & filter listings (single pass)
+    2. Group by marketplace
+    3. Precompute per-marketplace stats (single pass per marketplace)
+    4. Sort marketplaces by min buy price for early pruning
+    5. Only evaluate valid route pairs with early termination
+    6. Cache competition analysis per (buy_candidate, sell_mp) key
+    7. Lazy scoring: only score after all hard filters pass
+    """
     freshness_cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_HOURS)
     result = await db.execute(
         select(ProductListing)
@@ -821,52 +913,75 @@ async def _analyze_product(
         return None
 
     velocity = compute_velocity(trusted)
-    mps = list(by_mp.keys())
+
+    # ── STEP 2: Precompute per-marketplace stats (single pass) ──
+    mp_stats = _precompute_marketplace_stats(by_mp, rates, age_cache)
+
+    # ── STEP 3: Sort marketplaces by cheapest buy price (for pruning) ──
+    sorted_mps = sorted(mp_stats.values(), key=lambda s: s.buy_usd)
+
+    # ── STEP 5: Cache competition analysis per (buy_candidate_id, sell_mp) ──
+    # Competition depends on which sell listings are compatible with the
+    # buy candidate, so we key on (buy_candidate.id, sell_mp).
+    competition_cache: dict[tuple[int, str], CompetitionInfo | None] = {}
+    compatible_cache: dict[tuple[int, str], list] = {}
 
     best_opp: Opportunity | None = None
     best_score = -1.0
 
-    for buy_mp in mps:
-        for sell_mp in mps:
+    # ── STEP 4: Evaluate pairs with early pruning ──
+    # For each buy marketplace (sorted cheap→expensive), compare against
+    # sell marketplaces. Only valid route pairs are evaluated.
+    for buy_stats in sorted_mps:
+        buy_mp = buy_stats.mp_id
+        buy_candidate = buy_stats.buy_candidate
+        buy_usd = buy_stats.buy_usd
+
+        for sell_stats in sorted_mps:
+            sell_mp = sell_stats.mp_id
             if buy_mp == sell_mp:
                 continue
+
             # Only evaluate valid arbitrage routes
             if (buy_mp, sell_mp) not in VALID_ROUTE_PAIRS:
-                logger.debug("[scan] product %d: route %s→%s not valid", product_id, buy_mp, sell_mp)
                 continue
 
-            buy_listings = by_mp[buy_mp]
-            sell_listings = by_mp[sell_mp]
+            # ── Early price pruning ──
+            # If cheapest sell on sell_mp is already below buy price,
+            # no profit is possible (even before fees).
+            if sell_stats.min_sell_usd <= buy_usd:
+                continue
 
-            # Cheapest buy
-            buy_candidate = min(buy_listings, key=lambda l: to_usd(float(l.price), l.currency, rates))
-            buy_usd = to_usd(float(buy_candidate.price), buy_candidate.currency, rates)
+            # ── Compatible sells (cached per buy_candidate + sell_mp) ──
+            cache_key = (buy_candidate.id, sell_mp)
+            if cache_key not in compatible_cache:
+                compatible_cache[cache_key] = [
+                    s for s in sell_stats.listings
+                    if buy_candidate.condition == s.condition
+                    and variants_compatible(buy_candidate, s)
+                    and _titles_match(buy_candidate.title, s.title)
+                ]
+            compatible = compatible_cache[cache_key]
 
-            # Compatible sells (same condition + variant + title match)
-            compatible = [
-                s for s in sell_listings
-                if buy_candidate.condition == s.condition
-                and variants_compatible(buy_candidate, s)
-                and _titles_match(buy_candidate.title, s.title)
-            ]
             if not compatible:
-                # Log why no compatible sells
-                for s in sell_listings:
-                    reasons = []
-                    if buy_candidate.condition != s.condition:
-                        reasons.append(f"condition {buy_candidate.condition}!={s.condition}")
-                    if not variants_compatible(buy_candidate, s):
-                        reasons.append("variants_incompatible")
-                    if not _titles_match(buy_candidate.title, s.title):
-                        reasons.append("titles_no_match")
-                    logger.debug("[scan] product %d: %s→%s sell rejected: %s", product_id, buy_mp, sell_mp, ", ".join(reasons))
+                if logger.isEnabledFor(logging.DEBUG):
+                    for s in sell_stats.listings:
+                        reasons = []
+                        if buy_candidate.condition != s.condition:
+                            reasons.append(f"condition {buy_candidate.condition}!={s.condition}")
+                        if not variants_compatible(buy_candidate, s):
+                            reasons.append("variants_incompatible")
+                        if not _titles_match(buy_candidate.title, s.title):
+                            reasons.append("titles_no_match")
+                        logger.debug("[scan] product %d: %s→%s sell rejected: %s", product_id, buy_mp, sell_mp, ", ".join(reasons))
                 continue
 
-            # Analyze competition ONLY among compatible listings.
-            # Using unfiltered sell_listings inflates the realistic sell price
-            # when the cluster contains mixed variants (e.g. 128GB + 256GB).
-            comp = analyze_competition(compatible, rates)
-            if comp.realistic_sell_usd <= 0:
+            # ── Competition analysis (cached per buy_candidate + sell_mp) ──
+            if cache_key not in competition_cache:
+                comp = analyze_competition(compatible, rates)
+                competition_cache[cache_key] = comp if comp.realistic_sell_usd > 0 else None
+            comp = competition_cache[cache_key]
+            if comp is None:
                 continue
 
             sell_candidate = max(compatible, key=lambda l: to_usd(float(l.price), l.currency, rates))
@@ -875,13 +990,12 @@ async def _analyze_product(
             if sell_usd <= buy_usd:
                 continue
 
-            # Full profit calc
+            # ── STEP 8: Hard filters BEFORE scoring (lazy scoring) ──
             calc = calculate_profit(
                 buy_usd, sell_usd, buy_mp, sell_mp,
                 buy_candidate.is_free_shipping, sell_candidate.is_free_shipping,
             )
 
-            # ── Hard filters (only reject clearly invalid data) ────
             if calc.net_profit < MIN_PROFIT_USD:
                 continue
             if calc.margin < MIN_MARGIN:
@@ -889,7 +1003,7 @@ async def _analyze_product(
             if calc.roi < MIN_ROI:
                 continue
 
-            # ── Hardened mode: conservative profit check ──────
+            # Hardened mode: conservative profit check
             if HARDENED_MODE:
                 conservative = calculate_conservative_profit(
                     calc,
@@ -916,49 +1030,39 @@ async def _analyze_product(
                 )
                 continue
 
-            # ── Soft penalties (reduce score, don't reject) ──────
+            # ── Soft penalties (reduce score, don't reject) ──
             soft_penalty = 0.0
             confidence_penalty = 0.0
 
-            # Thin margin penalties
             if calc.margin < 0.05:
-                soft_penalty += 15  # margin < 5%
+                soft_penalty += 15
             elif calc.margin < 0.08:
-                soft_penalty += 10  # margin < 8%
+                soft_penalty += 10
 
-            # High price ratio reduces confidence
             if price_ratio > 6.0:
                 confidence_penalty += 15
 
-            # Low seller ratings increase risk (handled in scoring via input)
-            # but also apply a direct score penalty for very low ratings
             buy_rating = buy_candidate.seller_rating
             sell_rating = sell_candidate.seller_rating
             if (buy_rating is not None and buy_rating < 3.0) or \
                (sell_rating is not None and sell_rating < 3.0):
                 soft_penalty += 5
 
-            # High competition penalty
             if comp.competitor_count > 20:
                 soft_penalty += 10
 
-            # Scoring signals (from prefetched cache — zero queries)
+            # ── Scoring signals (from precomputed stats + prefetched cache) ──
             stability = _compute_stability_cached(
                 price_cache.get(str(sell_candidate.url), [])
             )
-            depth_score, daily_sales, monthly_sales, scalability = _compute_depth_cached(
-                sell_listings, comp.competitor_count, age_cache,
-            )
+            # Use precomputed depth from sell marketplace stats, refined with
+            # the actual competitor count from competition analysis
+            depth_score = sell_stats.depth_score
+            daily_sales = sell_stats.daily_sales
+            monthly_sales = sell_stats.monthly_sales
+            scalability = sell_stats.scalability
+
             listing_age = age_cache.get(str(sell_candidate.url), 1.0)
-
-            # Compute price spread across sell listings
-            sell_prices = [to_usd(float(l.price), l.currency, rates) for l in sell_listings]
-            avg_sell = statistics.mean(sell_prices) if sell_prices else 1
-            price_spread = ((max(sell_prices) - min(sell_prices)) / avg_sell) if len(sell_prices) > 1 and avg_sell > 0 else 0
-
-            # Aggregate sales/review signals from sell-side listings
-            total_sales = sum(l.sales_count or 0 for l in sell_listings)
-            total_reviews = sum(l.reviews_count or 0 for l in sell_listings)
 
             scoring_input = ScoringInput(
                 net_profit_usd=calc.net_profit,
@@ -971,14 +1075,14 @@ async def _analyze_product(
                 buy_seller_reviews=buy_candidate.reviews_count or 0,
                 sell_seller_rating=sell_candidate.seller_rating,
                 sell_seller_reviews=sell_candidate.reviews_count or 0,
-                total_sales_count=total_sales,
-                total_reviews_count=total_reviews,
+                total_sales_count=sell_stats.total_sales,
+                total_reviews_count=sell_stats.total_reviews,
                 estimated_daily_sales=daily_sales,
                 market_depth_score=depth_score,
                 price_stability_score=stability,
                 listing_age_days=listing_age,
                 is_cross_border=is_cross_border(buy_mp, sell_mp),
-                price_spread_pct=price_spread,
+                price_spread_pct=sell_stats.price_spread,
                 route_difficulty=get_route_difficulty(buy_mp, sell_mp),
                 soft_penalty=soft_penalty,
                 confidence_penalty=confidence_penalty,

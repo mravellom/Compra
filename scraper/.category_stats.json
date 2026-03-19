@@ -1,15 +1,15 @@
 {
   "audifonos": {
-    "total_listings": 200,
+    "total_listings": 56,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
-    "cycles_scraped": 6,
-    "last_scraped_at": 1773529975.7374904,
+    "cycles_scraped": 20,
+    "last_scraped_at": 1773869380.1986005,
     "pages_allocated": 7
   },
   "parlantes": {
-    "total_listings": 196,
+    "total_listings": 40,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -18,7 +18,7 @@
     "pages_allocated": 7
   },
   "celulares": {
-    "total_listings": 199,
+    "total_listings": 42,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -27,7 +27,7 @@
     "pages_allocated": 7
   },
   "accesorios-celulares": {
-    "total_listings": 1,
+    "total_listings": 0,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -36,7 +36,7 @@
     "pages_allocated": 7
   },
   "smartwatch": {
-    "total_listings": 148,
+    "total_listings": 31,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -45,7 +45,7 @@
     "pages_allocated": 7
   },
   "tablets": {
-    "total_listings": 105,
+    "total_listings": 21,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -54,7 +54,7 @@
     "pages_allocated": 7
   },
   "perifericos": {
-    "total_listings": 94,
+    "total_listings": 18,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -63,7 +63,7 @@
     "pages_allocated": 7
   },
   "consolas": {
-    "total_listings": 54,
+    "total_listings": 9,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -72,7 +72,7 @@
     "pages_allocated": 7
   },
   "accesorios-gaming": {
-    "total_listings": 104,
+    "total_listings": 20,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -81,7 +81,7 @@
     "pages_allocated": 7
   },
   "camaras-digitales": {
-    "total_listings": 87,
+    "total_listings": 17,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -90,7 +90,7 @@
     "pages_allocated": 7
   },
   "herramientas-electricas": {
-    "total_listings": 138,
+    "total_listings": 28,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -99,7 +99,7 @@
     "pages_allocated": 7
   },
   "electrodomesticos": {
-    "total_listings": 156,
+    "total_listings": 32,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -108,7 +108,7 @@
     "pages_allocated": 7
   },
   "relojes": {
-    "total_listings": 287,
+    "total_listings": 63,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -117,7 +117,7 @@
     "pages_allocated": 7
   },
   "componentes-pc": {
-    "total_listings": 127,
+    "total_listings": 25,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -135,7 +135,7 @@
     "pages_allocated": 7
   },
   "baterias-cargadores": {
-    "total_listings": 3,
+    "total_listings": 0,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -144,7 +144,7 @@
     "pages_allocated": 7
   },
   "notebooks": {
-    "total_listings": 93,
+    "total_listings": 18,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -153,7 +153,7 @@
     "pages_allocated": 7
   },
   "almacenamiento": {
-    "total_listings": 138,
+    "total_listings": 28,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -162,7 +162,7 @@
     "pages_allocated": 7
   },
   "networking": {
-    "total_listings": 142,
+    "total_listings": 28,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -171,7 +171,7 @@
     "pages_allocated": 7
   },
   "drones": {
-    "total_listings": 4,
+    "total_listings": 0,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -180,7 +180,7 @@
     "pages_allocated": 7
   },
   "hogar-inteligente": {
-    "total_listings": 100,
+    "total_listings": 19,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -189,7 +189,7 @@
     "pages_allocated": 7
   },
   "robots-aspiradora": {
-    "total_listings": 144,
+    "total_listings": 29,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -198,7 +198,7 @@
     "pages_allocated": 7
   },
   "monitores": {
-    "total_listings": 128,
+    "total_listings": 25,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -207,7 +207,7 @@
     "pages_allocated": 7
   },
   "proyectores": {
-    "total_listings": 139,
+    "total_listings": 28,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,
@@ -252,7 +252,7 @@
     "pages_allocated": 7
   },
   "impresoras": {
-    "total_listings": 1,
+    "total_listings": 0,
     "total_opportunities": 0,
     "total_profitable_opportunities": 0,
     "avg_roi": 0.0,

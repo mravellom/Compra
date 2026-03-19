@@ -10,5 +10,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY processor/ ./processor/
+COPY scraper/ ./scraper/
 
 CMD ["python", "-m", "processor.consumer"]

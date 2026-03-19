@@ -1,6 +1,7 @@
-import { Component, inject, signal } from '@angular/core';
+import { Component, inject, signal, ViewChild } from '@angular/core';
 import { RouterOutlet, RouterLink, RouterLinkActive } from '@angular/router';
 import { NotificationToastComponent } from '../../../shared/components/notification-toast/notification-toast.component';
+import { TutorialWalkthroughComponent } from '../../../shared/components/tutorial-walkthrough/tutorial-walkthrough.component';
 import { OpportunityFacade } from '../../../application/facades/opportunity.facade';
 import { HealthFacade } from '../../../application/facades/health.facade';
 
@@ -13,7 +14,7 @@ interface NavItem {
 @Component({
   selector: 'app-main-layout',
   standalone: true,
-  imports: [RouterOutlet, RouterLink, RouterLinkActive, NotificationToastComponent],
+  imports: [RouterOutlet, RouterLink, RouterLinkActive, NotificationToastComponent, TutorialWalkthroughComponent],
   template: `
     <div class="min-h-screen bg-surface-900 flex">
       <!-- Sidebar Nav -->
@@ -59,7 +60,12 @@ interface NavItem {
         </div>
 
         <!-- Status Footer -->
-        <div class="px-4 py-3 border-t border-surface-600">
+        <div class="px-4 py-3 border-t border-surface-600 space-y-2">
+          <button (click)="openTutorial()"
+                  class="flex items-center gap-2.5 w-full px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-accent-blue hover:bg-accent-blue/10 transition-colors">
+            <span class="w-5 h-5 rounded-full border border-current flex items-center justify-center text-xs font-bold">?</span>
+            <span>Guia operativa</span>
+          </button>
           <div class="flex items-center gap-2 text-xs text-gray-500">
             <span class="w-2 h-2 rounded-full animate-pulse"
                   [class]="healthStatus() === 'ok' ? 'bg-accent-green' : 'bg-accent-red'"></span>
@@ -90,11 +96,14 @@ interface NavItem {
     </div>
 
     <app-notification-toast />
+    <app-tutorial-walkthrough />
   `,
 })
 export class MainLayoutComponent {
   readonly oppFacade = inject(OpportunityFacade);
   private readonly healthFacade = inject(HealthFacade);
+
+  @ViewChild(TutorialWalkthroughComponent) tutorial!: TutorialWalkthroughComponent;
 
   readonly sidebarOpen = signal(false);
 
@@ -117,5 +126,10 @@ export class MainLayoutComponent {
 
   runScan(): void {
     this.oppFacade.triggerScan();
+  }
+
+  openTutorial(): void {
+    this.sidebarOpen.set(false);
+    this.tutorial.open();
   }
 }

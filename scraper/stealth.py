@@ -280,7 +280,7 @@ class StealthSession:
     - Session rotation after N requests
     """
 
-    REQUESTS_PER_SESSION = 15  # Rotate session after this many requests
+    REQUESTS_PER_SESSION = int(os.getenv("REQUESTS_PER_SESSION", "50"))  # Rotate session after this many requests
     BASE_DELAY = 2.0  # Base delay between requests (seconds)
     JITTER_FACTOR = 0.5  # ± 50% jitter
 
@@ -332,6 +332,10 @@ class StealthSession:
             proxy=proxy_arg,
             follow_redirects=True,
             timeout=30,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+            ),
         )
         self._request_count = 0
 

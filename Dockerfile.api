@@ -10,6 +10,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api/ ./api/
+COPY monetization/ ./monetization/
+COPY observability/ ./observability/
+COPY capital_management/ ./capital_management/
+COPY engines/ ./engines/
+COPY execution_realism/ ./execution_realism/
+COPY truth_engine/ ./truth_engine/
 
 EXPOSE 8000
 

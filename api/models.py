@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
+from typing import Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     ARRAY,
+    Date,
     Integer,
     REAL,
     BigInteger,
@@ -11,8 +13,10 @@ from sqlalchemy import (
     ForeignKey,
     Numeric,
     Text,
+    UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -24,13 +28,17 @@ class MasterProduct(Base):
     __tablename__ = "master_products"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     brand: Mapped[str | None] = mapped_column(Text)
     model: Mapped[str | None] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(Text)
     embedding = mapped_column(Vector(384), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Materialized price stats (processor writes via asyncpg, migration 015)
+    median_price_usd: Mapped[float | None] = mapped_column(Numeric(12, 2), default=0)
+    listing_price_count: Mapped[int] = mapped_column(Integer, default=0)
 
     # Discovery & trending
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -58,7 +66,7 @@ class ProductListing(Base):
     normalized_title: Mapped[str] = mapped_column(Text, nullable=False)
     price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(Text, default="USD")
-    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     marketplace_id: Mapped[str] = mapped_column(Text, nullable=False)
     image_url: Mapped[str | None] = mapped_column(Text)
     similarity_score: Mapped[float | None] = mapped_column(REAL)
@@ -163,7 +171,7 @@ class OpportunityHistory(Base):
     __tablename__ = "opportunity_history"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    opportunity_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    opportunity_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("opportunities.id"), nullable=False)
     master_product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("master_products.id"), nullable=False)
     net_profit: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     roi: Mapped[float] = mapped_column(REAL, nullable=False)
@@ -208,7 +216,7 @@ class PricePrediction(Base):
     confidence_upper: Mapped[float | None] = mapped_column(Numeric(12, 2))
     mape: Mapped[float | None] = mapped_column(REAL)
     confidence: Mapped[float] = mapped_column(REAL, default=0.5)
-    features_used: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    features_used: Mapped[dict | None] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(Text, default="computed")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -228,7 +236,7 @@ class ProductTrend(Base):
     volume_change: Mapped[float] = mapped_column(REAL, default=0)
     trend_type: Mapped[str] = mapped_column(Text, default="stable")
     trend_strength: Mapped[str] = mapped_column(Text, default="weak")
-    signals: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    signals: Mapped[dict | None] = mapped_column(JSONB, default=dict)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -251,7 +259,7 @@ class ExecutionOrder(Base):
     status: Mapped[str] = mapped_column(Text, default="draft")
     approval_state: Mapped[str] = mapped_column(Text, default="pending")
     execution_mode: Mapped[str] = mapped_column(Text, default="manual")
-    risk_assessment: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    risk_assessment: Mapped[dict | None] = mapped_column(JSONB, default=dict)
     error_message: Mapped[str | None] = mapped_column(Text)
     approved_by: Mapped[str | None] = mapped_column(Text)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -268,7 +276,7 @@ class ExecutionLog(Base):
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     old_status: Mapped[str | None] = mapped_column(Text)
     new_status: Mapped[str | None] = mapped_column(Text)
-    details: Mapped[dict | None] = mapped_column(Text)  # JSON string
+    details: Mapped[dict | None] = mapped_column(JSONB, default=dict)
     actor: Mapped[str] = mapped_column(Text, default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -329,3 +337,61 @@ class AlertConfig(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AlertSent(Base):
+    """History of sent alert notifications (migration 002)."""
+    __tablename__ = "alerts_sent"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    opportunity_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("opportunities.id"), nullable=False)
+    alert_config_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("alert_configs.id"), nullable=False)
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============================================================
+# Product Snapshots (migration 009)
+# ============================================================
+
+class ProductSnapshot(Base):
+    """Daily product snapshots for trend/velocity calculations."""
+    __tablename__ = "product_snapshots"
+    __table_args__ = (
+        UniqueConstraint("master_product_id", "snapshot_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    master_product_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("master_products.id"), nullable=False)
+    snapshot_date: Mapped[datetime] = mapped_column(Date, nullable=False, server_default=func.current_date())
+    listing_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    marketplace_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seller_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_price: Mapped[float | None] = mapped_column(Numeric(12, 2), default=0)
+    min_price: Mapped[float | None] = mapped_column(Numeric(12, 2), default=0)
+    max_price: Mapped[float | None] = mapped_column(Numeric(12, 2), default=0)
+    total_reviews: Mapped[int | None] = mapped_column(Integer, default=0)
+    total_sales: Mapped[int | None] = mapped_column(Integer, default=0)
+
+
+# ============================================================
+# Orchestrator Pipelines (migration 018)
+# ============================================================
+
+class OrchestratorPipeline(Base):
+    """Orchestrator pipeline execution records."""
+    __tablename__ = "orchestrator_pipelines"
+
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    pipeline_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    opportunity_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    product_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
+    decision: Mapped[str | None] = mapped_column(Text)
+    decision_score: Mapped[float | None] = mapped_column(REAL)
+    signal_strength: Mapped[str | None] = mapped_column(Text)
+    phases: Mapped[dict | None] = mapped_column(JSONB, default=dict)
+    reasons: Mapped[list | None] = mapped_column(JSONB, default=list)
+    total_duration_ms: Mapped[float | None] = mapped_column(REAL)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

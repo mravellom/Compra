@@ -61,7 +61,13 @@ _CATEGORY_IDS: dict[str, str] = {
 
 
 class AliExpressCategoryCrawler:
-    """Crawls AliExpress using internal search API, with HTML fallback."""
+    """Crawls AliExpress using internal search API, with HTML fallback.
+
+    v2: Uses a shared httpx.AsyncClient with connection pooling instead
+    of creating a new client per request. The client is initialized on
+    first use and reused for all API/HTML fetches within the crawler's
+    lifetime, preserving TCP connections and keep-alive.
+    """
 
     marketplace_id = "aliexpress"
 
@@ -72,6 +78,30 @@ class AliExpressCategoryCrawler:
     ):
         self._rate_limiter = rate_limiter
         self._proxy_pool = proxy_pool
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create a shared httpx client with connection pooling."""
+        if self._client is None:
+            proxy_url = None
+            if self._proxy_pool and self._proxy_pool.has_proxies:
+                proxy_url = await self._proxy_pool.get_proxy()
+            self._client = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=20.0,
+                proxy=proxy_url,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                ),
+            )
+        return self._client
+
+    async def close(self) -> None:
+        """Close the shared HTTP client."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
     async def crawl_category(
         self, category_slug: str, max_pages: int = 3
@@ -128,7 +158,7 @@ class AliExpressCategoryCrawler:
 
         return all_listings
 
-    # ── API fetch ─────────────────────────────────────────────
+    # ── API fetch (shared client) ─────────────────────────────
     async def _fetch_api(
         self, category_slug: str, page: int, seen_ids: set[str]
     ) -> list[RawListing]:
@@ -152,65 +182,61 @@ class AliExpressCategoryCrawler:
         })
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True, timeout=20.0
-            ) as client:
-                resp = await client.get(_API_URL, params=params, headers=headers)
-                if resp.status_code != 200:
-                    logger.debug("[aliexpress] API returned %d", resp.status_code)
-                    return []
+            client = await self._get_client()
+            resp = await client.get(_API_URL, params=params, headers=headers)
+            if resp.status_code != 200:
+                logger.debug("[aliexpress] API returned %d", resp.status_code)
+                return []
 
-                data = resp.json()
-                items = (
-                    data.get("data", {}).get("root", {}).get("fields", {})
-                    .get("mods", {}).get("itemList", {}).get("content", [])
-                )
-                if not items:
-                    # Try alternative path
-                    items = data.get("result", {}).get("resultList", [])
-                if not items:
-                    self._deep_find_items(data, items := [])
+            data = resp.json()
+            items = (
+                data.get("data", {}).get("root", {}).get("fields", {})
+                .get("mods", {}).get("itemList", {}).get("content", [])
+            )
+            if not items:
+                # Try alternative path
+                items = data.get("result", {}).get("resultList", [])
+            if not items:
+                self._deep_find_items(data, items := [])
 
-                listings: list[RawListing] = []
-                for item in items:
-                    try:
-                        product_id = str(
-                            item.get("productId", "")
-                            or item.get("product_id", "")
-                            or item.get("id", "")
-                        )
-                        if product_id and product_id in seen_ids:
-                            continue
-                        listing = self._parse_json_item(item)
-                        if listing:
-                            if product_id:
-                                seen_ids.add(product_id)
-                            listings.append(listing)
-                    except Exception:
+            listings: list[RawListing] = []
+            for item in items:
+                try:
+                    product_id = str(
+                        item.get("productId", "")
+                        or item.get("product_id", "")
+                        or item.get("id", "")
+                    )
+                    if product_id and product_id in seen_ids:
                         continue
+                    listing = self._parse_json_item(item)
+                    if listing:
+                        if product_id:
+                            seen_ids.add(product_id)
+                        listings.append(listing)
+                except Exception:
+                    continue
 
-                if listings:
-                    logger.info("[aliexpress] API returned %d items for '%s' page %d",
-                                len(listings), category_slug, page)
-                return listings
+            if listings:
+                logger.info("[aliexpress] API returned %d items for '%s' page %d",
+                            len(listings), category_slug, page)
+            return listings
 
         except Exception:
             logger.debug("[aliexpress] API fetch failed", exc_info=True)
             return []
 
-    # ── httpx fetch ───────────────────────────────────────────
+    # ── httpx fetch (shared client) ───────────────────────────
     async def _fetch_httpx(self, url: str) -> str | None:
-        """Fast HTTP fetch — works when server returns rendered HTML."""
+        """Fast HTTP fetch — reuses shared client with connection pooling."""
         headers = get_random_headers()
         headers["referer"] = _REFERER_BASE + "/"
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True, timeout=20.0
-            ) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code == 200 and len(resp.text) > 5000:
-                    return resp.text
+            client = await self._get_client()
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200 and len(resp.text) > 5000:
+                return resp.text
         except Exception:
             logger.debug("[aliexpress] httpx fetch failed for %s", url[:80])
         return None
