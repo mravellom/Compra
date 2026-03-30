@@ -15,7 +15,7 @@ _TTL_SECONDS = 3600  # 1 hour
 
 FALLBACK_RATES: dict[str, float] = {
     "USD": 1.0,
-    "ARS": 1450.0,
+    "ARS": 1050.0,
     "MXN": 17.8,
     "EUR": 0.86,
     "GBP": 0.75,
@@ -112,12 +112,26 @@ def fx_convert(
     if from_currency == "USD":
         usd = amount
     else:
-        rate = rates.get(from_currency, 1.0)
+        rate = rates.get(from_currency)
+        if rate is None:
+            rate = FALLBACK_RATES.get(from_currency)
+            if rate is not None:
+                logger.warning("FX rate missing for %s in live rates, using fallback %.2f", from_currency, rate)
+            else:
+                logger.error("FX rate unknown for %s, treating as 1:1 USD — PRICES MAY BE WRONG", from_currency)
+                rate = 1.0
         usd = amount / rate if rate > 0 else amount
     # Step 2: USD → to_currency
     if to_currency == "USD":
         return usd
-    target_rate = rates.get(to_currency, 1.0)
+    target_rate = rates.get(to_currency)
+    if target_rate is None:
+        target_rate = FALLBACK_RATES.get(to_currency)
+        if target_rate is not None:
+            logger.warning("FX rate missing for %s in live rates, using fallback %.2f", to_currency, target_rate)
+        else:
+            logger.error("FX rate unknown for %s, treating as 1:1 USD — PRICES MAY BE WRONG", to_currency)
+            target_rate = 1.0
     return usd * target_rate if target_rate > 0 else usd
 
 

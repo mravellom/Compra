@@ -51,9 +51,11 @@ class AmazonScraper:
                 if listing:
                     listings.append(listing)
             except Exception:
-                logger.debug("Skipping Amazon item, parse error", exc_info=True)
+                logger.warning("Skipping Amazon item, parse error", exc_info=True)
 
-        logger.info("Scraped %d listings for '%s'", len(listings), search_term)
+        logger.info("Scraped %d/%d Amazon listings for '%s' (%.0f%% parse rate)",
+                     len(listings), len(items[:max_results]), search_term,
+                     (len(listings) / len(items[:max_results]) * 100) if items[:max_results] else 0)
         return listings
 
     def _parse_item(self, item) -> RawListing | None:

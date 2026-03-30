@@ -19,6 +19,12 @@ frontend/node_modules/
 frontend/dist/
 frontend/.angular/
 
+# Backups
+backups/*.dump
+
+# Scraper WAL (Redis failure recovery)
+scraper/.wal/
+
 # OS
 .DS_Store
 venv/

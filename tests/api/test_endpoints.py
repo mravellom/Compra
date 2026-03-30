@@ -25,12 +25,19 @@ from api.main import app
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     """Create a test client that bypasses lifespan events."""
     from fastapi.testclient import TestClient
+    # Set a test API key so auth passes
+    monkeypatch.setenv("API_KEY", "test-key-for-ci")
+    # Reload the middleware module to pick up the new API_KEY
+    import api.middleware as mw
+    monkeypatch.setattr(mw, "API_KEY", "test-key-for-ci")
     # Override the lifespan to avoid DB/Redis initialization
     app.router.lifespan_context = _noop_lifespan
-    return TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app, raise_server_exceptions=False)
+    client.headers["X-API-Key"] = "test-key-for-ci"
+    return client
 
 
 from contextlib import asynccontextmanager

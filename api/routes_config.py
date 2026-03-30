@@ -10,6 +10,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "amazon": {
         "commission": 0.15,
         "payment_processing": 0.0,
+        "payment_fixed_fee": 0.0,
         "vat_rate": 0.16,        # Mexico IVA 16%
         "domestic_shipping": 0.0,
         "currency": "MXN",
@@ -19,6 +20,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "amazon_us": {
         "commission": 0.15,
         "payment_processing": 0.0,
+        "payment_fixed_fee": 0.0,
         "vat_rate": 0.0,         # US: no VAT
         "domestic_shipping": 0.0,
         "currency": "USD",
@@ -28,6 +30,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "mercadolibre_mx": {
         "commission": 0.16,
         "payment_processing": 0.036,
+        "payment_fixed_fee": 5.0,  # MXN
         "vat_rate": 0.16,        # Mexico IVA 16%
         "domestic_shipping": 0.0,
         "currency": "MXN",
@@ -37,6 +40,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "mercadolibre_ar": {
         "commission": 0.13,
         "payment_processing": 0.036,
+        "payment_fixed_fee": 450.0,  # ARS
         "vat_rate": 0.21,        # Argentina IVA 21%
         "domestic_shipping": 0.0,
         "currency": "ARS",
@@ -46,6 +50,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "mercadolibre_cl": {
         "commission": 0.13,
         "payment_processing": 0.036,
+        "payment_fixed_fee": 250.0,  # CLP
         "vat_rate": 0.19,        # Chile IVA 19%
         "domestic_shipping": 0.0,
         "currency": "CLP",
@@ -55,6 +60,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "ebay": {
         "commission": 0.1312,
         "payment_processing": 0.0,
+        "payment_fixed_fee": 0.0,
         "vat_rate": 0.0,         # US: no VAT
         "domestic_shipping": 8.0,
         "currency": "USD",
@@ -64,6 +70,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "aliexpress": {
         "commission": 0.08,
         "payment_processing": 0.0,
+        "payment_fixed_fee": 0.0,
         "vat_rate": 0.0,         # No VAT on buy side from CN
         "domestic_shipping": 0.0,
         "currency": "USD",       # AliExpress prices typically in USD
@@ -73,6 +80,7 @@ MARKETPLACE_FEES: dict[str, dict] = {
     "mercadolibre_co": {
         "commission": 0.14,
         "payment_processing": 0.036,
+        "payment_fixed_fee": 1200.0,  # COP
         "vat_rate": 0.19,        # Colombia IVA 19%
         "domestic_shipping": 0.0,
         "currency": "COP",

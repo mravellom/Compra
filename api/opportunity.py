@@ -144,12 +144,12 @@ def _titles_match(title_a: str | None, title_b: str | None) -> bool:
 
 
 # ── Configurable thresholds (v3: relaxed hard filters) ────
-MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "1"))
+MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "5"))
 MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.01"))       # 1% — soft penalties below 8%
 MIN_ROI = float(os.getenv("MIN_ROI", "0.01"))             # 1%
-MAX_ROI = float(os.getenv("MAX_ROI", "5.0"))              # 500% — allowed but penalized above 200%
+MAX_ROI = float(os.getenv("MAX_ROI", "1.5"))              # 150% — tighter cap to reject false positives
 MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "8.0"))  # 8x — allowed but penalized above 6x
-MIN_SELLER_RATING = float(os.getenv("MIN_SELLER_RATING", "1.5"))  # hard floor
+MIN_SELLER_RATING = float(os.getenv("MIN_SELLER_RATING", "2.5"))  # hard floor
 STALE_HOURS = int(os.getenv("STALE_HOURS", "48"))         # 48h freshness window
 
 # ── Data structures ───────────────────────────────────────
@@ -274,6 +274,7 @@ def calculate_profit(
     sell_mp: str,
     buy_free_ship: bool = False,
     sell_free_ship: bool = False,
+    rates: dict[str, float] | None = None,
 ) -> ProfitCalc:
     """Full profit calculation with all real-world costs."""
     sell_fees = MARKETPLACE_FEES.get(sell_mp, MARKETPLACE_FEES["ebay"])
@@ -282,7 +283,19 @@ def calculate_profit(
     payment_processing_rate = sell_fees.get("payment_processing", 0)
     payment_fee = sell_usd * payment_processing_rate
     if payment_processing_rate > 0:
-        payment_fee += 0.30  # Fixed fee only for marketplaces with separate payment processing
+        fixed_fee_local = sell_fees.get("payment_fixed_fee", 0.0)
+        sell_currency = sell_fees.get("currency", "USD")
+        if fixed_fee_local > 0:
+            from .currency import FALLBACK_RATES
+            fx_rate = (rates or {}).get(sell_currency)
+            if fx_rate is None:
+                fx_rate = FALLBACK_RATES.get(sell_currency)
+            if fx_rate is None or fx_rate <= 0:
+                logger.warning("No FX rate for %s, using fixed fee as USD", sell_currency)
+                fx_rate = 1.0
+            payment_fee += fixed_fee_local / fx_rate
+        else:
+            payment_fee += 0.30
     sell_tax = sell_usd * sell_fees.get("vat_rate", 0.0)
     domestic_shipping = 0.0 if sell_free_ship else sell_fees.get("domestic_shipping", 5.0)
 
@@ -291,9 +304,9 @@ def calculate_profit(
     if is_cross_border(buy_mp, sell_mp):
         cb_fees = get_cross_border_fees(buy_mp, sell_mp)
         international_shipping = cb_fees["shipping_usd"]
-        # CIF = Cost + Insurance + Freight
-        insurance = buy_usd * cb_fees.get("insurance_rate", 0.02)
-        cif_value = buy_usd + insurance + international_shipping
+        # CIF = Cost + Insurance + Freight (insurance on declared sell value)
+        insurance = sell_usd * cb_fees.get("insurance_rate", 0.02)
+        cif_value = sell_usd + insurance + international_shipping
         import_tax = cif_value * cb_fees["import_tax_rate"]
 
     total_fees = marketplace_fee + payment_fee + sell_tax + import_tax + domestic_shipping + international_shipping
@@ -994,6 +1007,7 @@ async def _analyze_product(
             calc = calculate_profit(
                 buy_usd, sell_usd, buy_mp, sell_mp,
                 buy_candidate.is_free_shipping, sell_candidate.is_free_shipping,
+                rates=rates,
             )
 
             if calc.net_profit < MIN_PROFIT_USD:
@@ -1010,7 +1024,7 @@ async def _analyze_product(
                     min_competitor_price_usd=comp.lowest_price_usd,
                 )
                 if not conservative.is_viable:
-                    logger.debug(
+                    logger.info(
                         "[hardened] product %d %s→%s rejected: %s",
                         product_id, buy_mp, sell_mp, conservative.rejection_reason,
                     )
@@ -1134,7 +1148,53 @@ async def _analyze_product(
                 )
 
     if best_opp:
-        # Upsert: check if active opp exists for this product+direction
+        # ── Arbitrage Validation (anti-false-positive layer) ──
+        from .arbitrage_validator import (
+            ArbitrageSnapshot, validate_arbitrage, SHADOW_MODE,
+        )
+        _buy_l = next((l for l in trusted if l.id == best_opp.buy_listing_id), None)
+        _sell_l = next((l for l in trusted if l.id == best_opp.sell_listing_id), None)
+        _buy_scraped = _buy_l.scraped_at.timestamp() if _buy_l and _buy_l.scraped_at else 0.0
+        _sell_scraped = _sell_l.scraped_at.timestamp() if _sell_l and _sell_l.scraped_at else 0.0
+        _sell_mp_key = best_opp.sell_marketplace
+        _compatible_prices = [
+            to_usd(float(l.price), l.currency, rates)
+            for l in by_mp.get(_sell_mp_key, [])
+        ]
+        snap = ArbitrageSnapshot(
+            buy_price_usd=float(best_opp.buy_price),
+            sell_price_usd=float(best_opp.sell_price),
+            buy_marketplace=best_opp.buy_marketplace,
+            sell_marketplace=best_opp.sell_marketplace,
+            buy_listing_scraped_at=_buy_scraped,
+            sell_listing_scraped_at=_sell_scraped,
+            buy_listing_id=best_opp.buy_listing_id,
+            sell_listing_id=best_opp.sell_listing_id,
+            product_id=product_id,
+            compatible_sell_prices_usd=_compatible_prices,
+            total_sales_count=mp_stats[_sell_mp_key].total_sales if _sell_mp_key in mp_stats else 0,
+            buy_free_shipping=_buy_l.is_free_shipping if _buy_l else False,
+            sell_free_shipping=_sell_l.is_free_shipping if _sell_l else False,
+            opportunity_score=best_opp.opportunity_score,
+            risk_score=best_opp.risk_score or 50.0,
+            confidence_score=best_opp.confidence_score or 50.0,
+            price_stability_score=best_opp.price_stability_score or 50.0,
+            liquidity_score=best_opp.market_depth_score or 50.0,
+            total_fees=float(best_opp.fees),
+            net_profit=float(best_opp.net_profit),
+            roi=float(best_opp.roi),
+            rates=rates,
+        )
+        validation = validate_arbitrage(snap, shadow_mode=SHADOW_MODE)
+        if not validation.is_valid:
+            logger.info(
+                "[validator] product %d %s→%s rejected (%d reasons): %s",
+                product_id, best_opp.buy_marketplace, best_opp.sell_marketplace,
+                len(validation.rejection_reasons), "; ".join(validation.rejection_reasons),
+            )
+            return None
+
+        # Upsert: check if active opp exists for this product+direction (locked)
         existing = await db.execute(
             select(Opportunity)
             .where(
@@ -1143,6 +1203,7 @@ async def _analyze_product(
                 Opportunity.sell_marketplace == best_opp.sell_marketplace,
                 Opportunity.status == "active",
             )
+            .with_for_update(skip_locked=True)
         )
         old = existing.scalars().first()
 

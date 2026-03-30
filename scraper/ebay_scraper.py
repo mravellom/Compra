@@ -64,9 +64,11 @@ class EbayScraper:
                 if listing:
                     listings.append(listing)
             except Exception:
-                logger.debug("Skipping eBay item, parse error", exc_info=True)
+                logger.warning("Skipping eBay item, parse error", exc_info=True)
 
-        logger.info("Scraped %d eBay listings for '%s'", len(listings), search_term)
+        logger.info("Scraped %d/%d eBay listings for '%s' (%.0f%% parse rate)",
+                     len(listings), len(items[:max_results]), search_term,
+                     (len(listings) / len(items[:max_results]) * 100) if items[:max_results] else 0)
         return listings
 
     # ── Fetch strategies ──────────────────────────────────────
@@ -232,4 +234,19 @@ class EbayScraper:
             return "EUR"
         if "GBP" in text or "\u00a3" in text:
             return "GBP"
+        if "C $" in text or "CA$" in text or "CDN$" in text:
+            return "CAD"
+        if "AU $" in text or "AU$" in text:
+            return "AUD"
+        if "MX$" in text:
+            return "MXN"
+        # "A$" check AFTER CA$/AU$ to avoid matching "USA$" or "CA$"
+        if re.search(r'(?<![A-Za-z])A\$', text):
+            return "AUD"
+        if "\u00a5" in text or "JPY" in text:
+            return "JPY"
+        # Only assume USD if price text contains $ or US indicator
+        if "$" in text or "US" in text:
+            return "USD"
+        logger.warning("Unknown currency in eBay price: %s, defaulting USD", text)
         return "USD"

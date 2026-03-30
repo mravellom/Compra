@@ -23,44 +23,49 @@ class TestCalculateProfit:
 
     def test_domestic_amazon_to_ml_mx(self):
         """Same country (MX): no cross-border fees, but VAT applies."""
-        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx")
+        rates = {"MXN": 17.0, "USD": 1.0}
+        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx", rates=rates)
         assert not is_cross_border("amazon", "mercadolibre_mx")
-        # ML MX: 16% commission + 3.6% payment + $0.30 fixed + 16% IVA
+        # ML MX: 16% commission + 3.6% payment + 5.0 MXN / 17.0 fixed + 16% IVA
         assert result.marketplace_fee == pytest.approx(32.0, abs=0.01)
-        assert result.payment_fee == pytest.approx(7.50, abs=0.01)  # 200*0.036 + 0.30
+        assert result.payment_fee == pytest.approx(200 * 0.036 + 5.0 / 17.0, abs=0.01)
         assert result.sell_tax == pytest.approx(32.0, abs=0.01)  # 200*0.16 IVA
         assert result.import_tax == 0.0
         assert result.international_shipping == 0.0
 
     def test_cross_border_mx_to_ar(self):
-        """MX -> AR: 50% import tax on CIF (buy + insurance + shipping) + $14 shipping."""
-        result = calculate_profit(100.0, 300.0, "amazon", "mercadolibre_ar")
+        """MX -> AR: 50% import tax on CIF (sell + insurance + shipping) + $14 shipping."""
+        rates = {"MXN": 17.0, "ARS": 1050.0, "USD": 1.0}
+        result = calculate_profit(100.0, 300.0, "amazon", "mercadolibre_ar", rates=rates)
         assert is_cross_border("amazon", "mercadolibre_ar")
-        # CIF = 100 + 2.0 (2% insurance) + 14 = 116, import_tax = 116 * 0.50 = 58.0
-        assert result.import_tax == pytest.approx(58.0, abs=0.01)
+        # CIF = 300 (sell) + 6.0 (2% insurance on sell) + 14 = 320, import_tax = 320 * 0.50 = 160.0
+        assert result.import_tax == pytest.approx(160.0, abs=0.01)
         assert result.international_shipping == 14.0
 
     def test_cross_border_ar_to_mx(self):
-        """AR -> MX: 16% import tax on CIF (buy + insurance + shipping) + $45 shipping."""
-        result = calculate_profit(100.0, 300.0, "mercadolibre_ar", "mercadolibre_mx")
-        # CIF = 100 + 2.0 (2% insurance) + 45 = 147, import_tax = 147 * 0.16 = 23.52
-        assert result.import_tax == pytest.approx(23.52, abs=0.01)
+        """AR -> MX: 16% import tax on CIF (sell + insurance + shipping) + $45 shipping."""
+        rates = {"MXN": 17.0, "ARS": 1050.0, "USD": 1.0}
+        result = calculate_profit(100.0, 300.0, "mercadolibre_ar", "mercadolibre_mx", rates=rates)
+        # CIF = 300 (sell) + 6.0 (2% insurance on sell) + 45 = 351, import_tax = 351 * 0.16 = 56.16
+        assert result.import_tax == pytest.approx(56.16, abs=0.01)
         assert result.international_shipping == 45.0
 
     def test_cross_border_us_to_mx(self):
         """US -> MX: 16% import tax + $15 shipping."""
-        result = calculate_profit(100.0, 300.0, "amazon_us", "mercadolibre_mx")
+        rates = {"MXN": 17.0, "USD": 1.0}
+        result = calculate_profit(100.0, 300.0, "amazon_us", "mercadolibre_mx", rates=rates)
         assert is_cross_border("amazon_us", "mercadolibre_mx")
-        # CIF = 100 + 2.0 + 15 = 117, import_tax = 117 * 0.16 = 18.72
-        assert result.import_tax == pytest.approx(18.72, abs=0.01)
+        # CIF = 300 (sell) + 6.0 (2% insurance on sell) + 15 = 321, import_tax = 321 * 0.16 = 51.36
+        assert result.import_tax == pytest.approx(51.36, abs=0.01)
         assert result.international_shipping == 15.0
 
     def test_cross_border_cn_to_mx(self):
         """CN -> MX: 16% import tax + $8 shipping (AliExpress)."""
-        result = calculate_profit(50.0, 200.0, "aliexpress", "mercadolibre_mx")
+        rates = {"MXN": 17.0, "USD": 1.0}
+        result = calculate_profit(50.0, 200.0, "aliexpress", "mercadolibre_mx", rates=rates)
         assert is_cross_border("aliexpress", "mercadolibre_mx")
-        # CIF = 50 + 1.0 + 8 = 59, import_tax = 59 * 0.16 = 9.44
-        assert result.import_tax == pytest.approx(9.44, abs=0.01)
+        # CIF = 200 (sell) + 4.0 (2% insurance on sell) + 8 = 212, import_tax = 212 * 0.16 = 33.92
+        assert result.import_tax == pytest.approx(33.92, abs=0.01)
         assert result.international_shipping == 8.0
 
     def test_payment_fee_only_when_payment_processing(self):
@@ -70,10 +75,11 @@ class TestCalculateProfit:
         assert result.payment_fee == 0.0
 
     def test_payment_fee_with_ml(self):
-        """ML has 3.6% payment_processing + $0.30 fixed fee."""
-        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx")
-        # 200 * 0.036 + 0.30 = 7.50
-        assert result.payment_fee == pytest.approx(7.50, abs=0.01)
+        """ML has 3.6% payment_processing + fixed fee in local currency."""
+        rates = {"MXN": 17.0, "USD": 1.0}
+        result = calculate_profit(100.0, 200.0, "amazon", "mercadolibre_mx", rates=rates)
+        # 200 * 0.036 + 5.0 MXN / 17.0 = 7.49
+        assert result.payment_fee == pytest.approx(200 * 0.036 + 5.0 / 17.0, abs=0.01)
 
     def test_zero_buy_price_no_division_error(self):
         """buy_price=0 → ROI must be 0.0, no ZeroDivisionError."""
@@ -151,7 +157,7 @@ class TestVariantsCompetitionIntegration:
 
     def test_vat_included_in_total_fees(self):
         """VAT/IVA must be part of total_fees and reduce net_profit."""
-        result_mx = calculate_profit(100.0, 200.0, "mercadolibre_mx", "mercadolibre_mx")
+        result_mx = calculate_profit(100.0, 200.0, "mercadolibre_mx", "mercadolibre_mx", rates={"MXN": 17.0})
         # sell_tax = 200 * 0.16 = 32.0
         assert result_mx.sell_tax == pytest.approx(32.0, abs=0.01)
         assert result_mx.sell_tax > 0

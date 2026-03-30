@@ -20,11 +20,14 @@ All checks produce a single ValidationResult with full observability.
 import hashlib
 import logging
 import math
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
 
 from .currency import to_usd
+
+SHADOW_MODE = os.getenv("SHADOW_MODE", "false").lower() in ("1", "true", "yes")
 from .opportunity import (
     MIN_PROFIT_USD,
     calculate_profit,
@@ -127,6 +130,9 @@ class ArbitrageSnapshot:
     total_fees: float = 0.0
     net_profit: float = 0.0
     roi: float = 0.0
+
+    # Exchange rates for fee recalculation
+    rates: dict[str, float] | None = None
 
 
 # ── Duplicate tracker (module-level singleton) ───────────────
@@ -301,11 +307,12 @@ def check_execution_simulation(
 
     decayed_sell = snap.sell_price_usd * decay_factor
 
-    # Re-calculate profit with full fee path
+    # Re-calculate profit with full fee path (including FX rates for fixed fees)
     calc = calculate_profit(
         snap.buy_price_usd, decayed_sell,
         snap.buy_marketplace, snap.sell_marketplace,
         snap.buy_free_shipping, snap.sell_free_shipping,
+        rates=snap.rates,
     )
 
     if calc.net_profit > 0:

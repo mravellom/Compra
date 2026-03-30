@@ -21,14 +21,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/capital", tags=["capital-management"])
 
 
-# ── Singleton portfolio state (process-level) ────────────────
+# ── Portfolio state: DB-backed with in-memory cache ────────────
 
 _portfolio_state: PortfolioState | None = None
 _current_config: CapitalConfig | None = None
+_db_store = None
+
+
+def _get_db_store():
+    """Lazy-init the DB store."""
+    global _db_store
+    if _db_store is None:
+        try:
+            from api.database import async_session
+            from .db_store import PortfolioDBStore
+            _db_store = PortfolioDBStore(async_session)
+        except Exception:
+            logger.warning("DB store not available, using in-memory portfolio")
+    return _db_store
 
 
 def get_portfolio_state() -> PortfolioState:
-    """Get or initialize the global portfolio state."""
+    """Get the cached portfolio state (read-only, for sync callers).
+
+    For mutations, use get_db_store().locked_portfolio() instead.
+    """
     global _portfolio_state, _current_config
     if _portfolio_state is None:
         _current_config = get_config()
@@ -37,6 +54,20 @@ def get_portfolio_state() -> PortfolioState:
             available_capital=_current_config.initial_capital,
         )
     return _portfolio_state
+
+
+async def load_portfolio_from_db() -> PortfolioState:
+    """Load portfolio from DB and update the in-memory cache."""
+    global _portfolio_state
+    store = _get_db_store()
+    if store:
+        _portfolio_state = await store.read_portfolio()
+    return get_portfolio_state()
+
+
+def get_db_store():
+    """Get the DB-backed portfolio store for locked mutations."""
+    return _get_db_store()
 
 
 def get_capital_config() -> CapitalConfig:
@@ -48,7 +79,7 @@ def get_capital_config() -> CapitalConfig:
 
 
 def set_portfolio_state(state: PortfolioState) -> None:
-    """Replace the global portfolio state (for testing/reset)."""
+    """Replace the in-memory portfolio state (for testing/reset)."""
     global _portfolio_state
     _portfolio_state = state
 
@@ -111,7 +142,7 @@ class StrategySwitchRequest(BaseModel):
 @router.get("/metrics", response_model=CapitalMetricsResponse)
 async def capital_metrics():
     """Current portfolio state and performance metrics."""
-    portfolio = get_portfolio_state()
+    portfolio = await load_portfolio_from_db()
     config = get_capital_config()
 
     return CapitalMetricsResponse(

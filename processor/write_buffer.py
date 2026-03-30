@@ -161,28 +161,35 @@ class MedianAccumulator:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE master_products mp
-                SET listing_price_count = COALESCE(mp.listing_price_count, 0) + batch.cnt,
-                    median_price_usd = CASE
-                        WHEN COALESCE(mp.listing_price_count, 0) = 0 THEN batch.price
-                        WHEN batch.price > COALESCE(mp.median_price_usd, 0)
-                            THEN COALESCE(mp.median_price_usd, 0) +
-                                 ((batch.price - COALESCE(mp.median_price_usd, 0)) * batch.cnt /
-                                  (COALESCE(mp.listing_price_count, 0) + batch.cnt))
-                        WHEN batch.price < COALESCE(mp.median_price_usd, 0)
-                            THEN COALESCE(mp.median_price_usd, 0) -
-                                 ((COALESCE(mp.median_price_usd, 0) - batch.price) * batch.cnt /
-                                  (COALESCE(mp.listing_price_count, 0) + batch.cnt))
-                        ELSE COALESCE(mp.median_price_usd, 0)
-                    END
-                FROM UNNEST($1::bigint[], $2::integer[], $3::numeric[])
-                    AS batch(id, cnt, price)
-                WHERE mp.id = batch.id
-                """,
-                up_ids, up_counts, up_prices,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    WITH locked AS (
+                        SELECT mp.id
+                        FROM master_products mp
+                        WHERE mp.id = ANY($1::bigint[])
+                        FOR UPDATE
+                    )
+                    UPDATE master_products mp
+                    SET listing_price_count = COALESCE(mp.listing_price_count, 0) + batch.cnt,
+                        median_price_usd = CASE
+                            WHEN COALESCE(mp.listing_price_count, 0) = 0 THEN batch.price
+                            WHEN batch.price > COALESCE(mp.median_price_usd, 0)
+                                THEN COALESCE(mp.median_price_usd, 0) +
+                                     ((batch.price - COALESCE(mp.median_price_usd, 0)) * batch.cnt /
+                                      (COALESCE(mp.listing_price_count, 0) + batch.cnt))
+                            WHEN batch.price < COALESCE(mp.median_price_usd, 0)
+                                THEN COALESCE(mp.median_price_usd, 0) -
+                                     ((COALESCE(mp.median_price_usd, 0) - batch.price) * batch.cnt /
+                                      (COALESCE(mp.listing_price_count, 0) + batch.cnt))
+                            ELSE COALESCE(mp.median_price_usd, 0)
+                        END
+                    FROM UNNEST($1::bigint[], $2::integer[], $3::numeric[])
+                        AS batch(id, cnt, price)
+                    WHERE mp.id = batch.id AND mp.id IN (SELECT id FROM locked)
+                    """,
+                    up_ids, up_counts, up_prices,
+                )
 
         elapsed = time.monotonic() - t0
         write_metrics.total_median_time += elapsed

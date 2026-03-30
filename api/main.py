@@ -16,6 +16,7 @@ from .routes.discovery import router as discovery_router
 from .routes.opportunities import router as opportunities_router
 from .routes.monetization import router as monetization_router, init_monetization, get_health_monitor
 from .routes.scoring import router as scoring_router
+from .routes.trades import router as trades_router
 from .routes.truth import router as truth_router
 
 # Engine routers
@@ -55,6 +56,9 @@ async def _auto_scan_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not os.getenv("API_KEY"):
+        logger.warning("API_KEY not set — API is UNAUTHENTICATED (localhost only). Set API_KEY for production.")
+
     # Initialize monetization publisher
     publisher = init_monetization()
     logger.info("Monetization publisher initialized with %d channels", len(publisher.channels))
@@ -66,10 +70,18 @@ async def lifespan(app: FastAPI):
         monitor_task = asyncio.create_task(health_monitor.start())
         logger.info("Health monitor started")
 
+    # Start health alerter
+    from .health_alerter import HealthAlerter
+    health_alerter_instance = HealthAlerter()
+    health_alerter_task = asyncio.create_task(health_alerter_instance.start())
+    logger.info("Health alerter started")
+
     scan_task = asyncio.create_task(_auto_scan_loop())
     logger.info("Auto-scan started (every %ds)", SCAN_INTERVAL)
     yield
     scan_task.cancel()
+    await health_alerter_instance.stop()
+    health_alerter_task.cancel()
     if monitor_task:
         if health_monitor:
             await health_monitor.stop()
@@ -116,6 +128,9 @@ app.include_router(scoring_router, prefix="/api/v1")
 
 # Truth engine & observability
 app.include_router(truth_router, prefix="/api/v1")
+
+# Trade outcomes & accuracy
+app.include_router(trades_router, prefix="/api/v1")
 
 # Capital management
 app.include_router(capital_router, prefix="/api/v1")

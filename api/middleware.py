@@ -18,13 +18,21 @@ API_KEY = os.getenv("API_KEY", "")  # Empty = no auth required
 
 
 def _check_api_key(request: Request) -> bool:
-    """Return True if request is authenticated or auth is disabled."""
-    if not API_KEY:
-        return True  # No auth configured
+    """Return True if request is authenticated or auth is disabled.
+
+    When API_KEY is not set, only allow requests from localhost.
+    API key via query params is disabled for security.
+    """
     # Skip auth for health endpoints and docs
     if request.url.path in ("/health", "/health/pipeline", "/docs", "/openapi.json"):
         return True
-    key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+
+    if not API_KEY:
+        # No auth configured — restrict to localhost only
+        client_ip = request.client.host if request.client else "unknown"
+        return client_ip in ("127.0.0.1", "::1")
+
+    key = request.headers.get("X-API-Key")
     if not key:
         return False
     return hashlib.sha256(key.encode()).hexdigest() == hashlib.sha256(API_KEY.encode()).hexdigest()

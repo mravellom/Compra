@@ -64,6 +64,7 @@ class ScoringProfileConfig:
     prime_min_conf: float = 55.0
     standard_min_opp: float = 40.0
     standard_max_risk: float = 55.0
+    standard_min_conf: float = 50.0
     avoid_max_opp: float = 25.0
 
 
@@ -212,15 +213,18 @@ def classify_risk(
     conf = result.confidence_score
 
     if opp >= config.prime_min_opp and risk <= config.prime_max_risk and conf >= config.prime_min_conf:
-        return RiskClass.PRIME
+        risk_class = RiskClass.PRIME
+    elif opp <= config.avoid_max_opp:
+        risk_class = RiskClass.AVOID
+    elif opp >= config.standard_min_opp and risk <= config.standard_max_risk and conf >= config.standard_min_conf:
+        risk_class = RiskClass.STANDARD
+    elif opp >= config.standard_min_opp and risk > config.standard_max_risk:
+        risk_class = RiskClass.SPECULATIVE
+    else:
+        risk_class = RiskClass.AVOID
 
-    if opp <= config.avoid_max_opp:
-        return RiskClass.AVOID
-
-    if opp >= config.standard_min_opp and risk <= config.standard_max_risk:
-        return RiskClass.STANDARD
-
-    if opp >= config.standard_min_opp and risk > config.standard_max_risk:
-        return RiskClass.SPECULATIVE
-
-    return RiskClass.AVOID
+    logger.info(
+        "scoring: opp=%.1f risk=%.1f conf=%.1f → %s",
+        opp, risk, conf, risk_class.value,
+    )
+    return risk_class

@@ -77,12 +77,81 @@ async def publish_to_stream(redis_client: redis.Redis, listing: RawListing) -> s
 _PUBLISH_CHUNK_SIZE = int(os.getenv("PUBLISH_CHUNK_SIZE", "100"))
 
 
+_WAL_DIR = os.path.join(os.path.dirname(__file__), ".wal")
+_WAL_ENABLED = os.getenv("SCRAPER_WAL", "true").lower() in ("1", "true", "yes")
+
+
+_WAL_MAX_BYTES = int(os.getenv("SCRAPER_WAL_MAX_BYTES", str(500 * 1024 * 1024)))  # 500MB
+
+
+def _save_to_wal(listings: list[RawListing]) -> None:
+    """Save failed listings to local WAL file for later replay."""
+    import json
+    import uuid
+    os.makedirs(_WAL_DIR, exist_ok=True)
+
+    # Check WAL size before writing — prevent disk exhaustion
+    total_size = sum(
+        os.path.getsize(os.path.join(_WAL_DIR, f))
+        for f in os.listdir(_WAL_DIR) if f.endswith(".jsonl")
+    ) if os.path.isdir(_WAL_DIR) else 0
+    if total_size > _WAL_MAX_BYTES:
+        logger.critical(
+            "WAL: disk limit reached (%.0f MB > %.0f MB). Dropping %d listings!",
+            total_size / 1e6, _WAL_MAX_BYTES / 1e6, len(listings),
+        )
+        return
+
+    # Use UUID to prevent filename collisions across processes
+    wal_file = os.path.join(_WAL_DIR, f"failed_{int(time.time())}_{uuid.uuid4().hex[:8]}.jsonl")
+    with open(wal_file, "w") as f:
+        for listing in listings:
+            f.write(json.dumps(listing.to_stream_dict()) + "\n")
+    logger.warning("WAL: saved %d listings to %s for later replay", len(listings), wal_file)
+
+
+async def replay_wal(redis_client: redis.Redis) -> int:
+    """Replay any saved WAL files back to Redis. Call on startup."""
+    import json
+    if not os.path.isdir(_WAL_DIR):
+        return 0
+    replayed = 0
+    for fname in sorted(os.listdir(_WAL_DIR)):
+        fpath = os.path.join(_WAL_DIR, fname)
+        if not fname.endswith(".jsonl"):
+            continue
+        try:
+            valid_entries = []
+            with open(fpath) as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        valid_entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning("WAL: corrupt line %d in %s, skipping", line_num, fname)
+            if valid_entries:
+                async with redis_client.pipeline(transaction=False) as pipe:
+                    for data in valid_entries:
+                        pipe.xadd(STREAM_KEY, data)
+                    await pipe.execute()
+                replayed += len(valid_entries)
+            os.remove(fpath)
+            logger.info("WAL: replayed %d listings from %s", len(valid_entries), fname)
+        except Exception:
+            logger.error("WAL: failed to replay %s", fname, exc_info=True)
+    return replayed
+
+
 async def publish_batch(redis_client: redis.Redis, listings: list[RawListing]) -> int:
     """Publish a batch of listings to Redis using pipeline batching.
 
     Groups listings into chunks and sends each chunk in a single Redis
     pipeline round-trip (N XADDs per pipeline.execute() instead of N
     individual round-trips).
+
+    If Redis is down, saves to local WAL for later replay.
     """
     if not listings:
         return 0
@@ -97,13 +166,19 @@ async def publish_batch(redis_client: redis.Redis, listings: list[RawListing]) -
                 results = await pipe.execute()
                 count += sum(1 for r in results if r is not None)
         except Exception:
-            # Fallback: publish remaining one by one
+            # Fallback: try one by one
+            chunk_failed = []
             for listing in chunk:
                 try:
                     await redis_client.xadd(STREAM_KEY, listing.to_stream_dict())
                     count += 1
                 except Exception:
-                    logger.error("Failed to publish listing: %s", listing.title[:40], exc_info=True)
+                    chunk_failed.append(listing)
+            # Save failures to WAL if enabled
+            if chunk_failed and _WAL_ENABLED:
+                _save_to_wal(chunk_failed)
+            elif chunk_failed:
+                logger.error("Lost %d listings (WAL disabled)", len(chunk_failed))
     return count
 
 
@@ -285,6 +360,11 @@ async def main() -> None:
 
     logger.info("Scraper mode: %s", SCRAPER_MODE)
 
+    # Replay any WAL files from previous failed Redis publishes
+    wal_count = await replay_wal(redis_client)
+    if wal_count:
+        logger.info("WAL replay: %d listings recovered from previous failures", wal_count)
+
     # Shared infra
     rate_limiter = RateLimiter(requests_per_second=0.5, burst=2)
     proxy_pool = ProxyPool()
@@ -363,6 +443,7 @@ async def main() -> None:
         loop.add_signal_handler(sig, _signal_handler)
 
     # Main loop
+    _zero_result_streak = 0
     try:
         while not stop_event.is_set():
             if SCRAPER_MODE == "orchestrated":
@@ -372,6 +453,23 @@ async def main() -> None:
                 total = await run_category_cycle(crawlers, redis_client, categories, dedup)
             else:
                 total = await run_search_cycle(scrapers, redis_client)
+
+            if total == 0:
+                _zero_result_streak += 1
+                logger.error(
+                    "SCRAPER ALERT: 0 listings in cycle (%d consecutive zero-result cycles)",
+                    _zero_result_streak,
+                )
+                if _zero_result_streak >= 3:
+                    logger.critical(
+                        "SCRAPER CRITICAL: %d consecutive zero-result cycles — "
+                        "all scrapers may be blocked or broken",
+                        _zero_result_streak,
+                    )
+            else:
+                if _zero_result_streak > 0:
+                    logger.info("Scraper recovered after %d zero-result cycles", _zero_result_streak)
+                _zero_result_streak = 0
 
             logger.info(
                 "Cycle complete: %d listings published to '%s'", total, STREAM_KEY

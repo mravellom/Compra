@@ -100,9 +100,11 @@ class MercadoLibreScraper:
                 if listing:
                     listings.append(listing)
             except Exception:
-                logger.debug("Skipping ML item, parse error", exc_info=True)
+                logger.warning("Skipping ML item, parse error", exc_info=True)
 
-        logger.info("Scraped %d listings for '%s'", len(listings), search_term)
+        logger.info("Scraped %d/%d ML listings for '%s' (%.0f%% parse rate)",
+                     len(listings), len(items[:max_results]), search_term,
+                     (len(listings) / len(items[:max_results]) * 100) if items[:max_results] else 0)
         return listings
 
     # ── Playwright path (CL, CO) ─────────────────────────────
@@ -180,9 +182,11 @@ class MercadoLibreScraper:
                 if listing:
                     listings.append(listing)
             except Exception:
-                logger.debug("Skipping ML item, parse error", exc_info=True)
+                logger.warning("Skipping ML item, parse error", exc_info=True)
 
-        logger.info("[Playwright] Scraped %d listings for '%s'", len(listings), search_term)
+        logger.info("[Playwright] Scraped %d/%d ML listings for '%s' (%.0f%% parse rate)",
+                     len(listings), len(items[:max_results]), search_term,
+                     (len(listings) / len(items[:max_results]) * 100) if items[:max_results] else 0)
         return listings
 
     # ── Parsing (shared by both paths) ───────────────────────
