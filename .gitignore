@@ -25,6 +25,9 @@ backups/*.dump
 # Scraper WAL (Redis failure recovery)
 scraper/.wal/
 
+# Scraper cache
+scraper/.category_stats.json
+
 # OS
 .DS_Store
 venv/
