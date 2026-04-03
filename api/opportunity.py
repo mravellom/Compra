@@ -144,13 +144,39 @@ def _titles_match(title_a: str | None, title_b: str | None) -> bool:
 
 
 # ── Configurable thresholds (v3: relaxed hard filters) ────
-MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "5"))
-MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.01"))       # 1% — soft penalties below 8%
-MIN_ROI = float(os.getenv("MIN_ROI", "0.01"))             # 1%
+# Base thresholds from env (used as defaults before truth engine adapts)
+_BASE_MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "5"))
+_BASE_MIN_MARGIN = float(os.getenv("MIN_MARGIN", "0.01"))       # 1%
+_BASE_MIN_ROI = float(os.getenv("MIN_ROI", "0.01"))             # 1%
 MAX_ROI = float(os.getenv("MAX_ROI", "1.5"))              # 150% — tighter cap to reject false positives
 MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "8.0"))  # 8x — allowed but penalized above 6x
 MIN_SELLER_RATING = float(os.getenv("MIN_SELLER_RATING", "2.5"))  # hard floor
 STALE_HOURS = int(os.getenv("STALE_HOURS", "48"))         # 48h freshness window
+
+
+def _get_adaptive_thresholds() -> tuple[float, float, float]:
+    """Get current thresholds from truth engine (adaptive) or fallback to env defaults.
+
+    Returns (min_profit_usd, min_margin, min_roi).
+    The truth engine adjusts these based on real trade outcomes.
+    """
+    try:
+        from truth_engine.integration import get_adaptive_thresholds
+        state = get_adaptive_thresholds()
+        # Use adaptive values but never go below base thresholds
+        return (
+            max(_BASE_MIN_PROFIT_USD, state.min_profit_usd),
+            _BASE_MIN_MARGIN,  # margin stays at base (not in adaptive state)
+            max(_BASE_MIN_ROI, state.min_roi),
+        )
+    except Exception:
+        return _BASE_MIN_PROFIT_USD, _BASE_MIN_MARGIN, _BASE_MIN_ROI
+
+
+# Keep module-level names for backward compat (used in other filters)
+MIN_PROFIT_USD = _BASE_MIN_PROFIT_USD
+MIN_MARGIN = _BASE_MIN_MARGIN
+MIN_ROI = _BASE_MIN_ROI
 
 # ── Data structures ───────────────────────────────────────
 @dataclass
@@ -1010,11 +1036,13 @@ async def _analyze_product(
                 rates=rates,
             )
 
-            if calc.net_profit < MIN_PROFIT_USD:
+            # Use adaptive thresholds from truth engine (adjusts based on real outcomes)
+            _min_profit, _min_margin, _min_roi = _get_adaptive_thresholds()
+            if calc.net_profit < _min_profit:
                 continue
-            if calc.margin < MIN_MARGIN:
+            if calc.margin < _min_margin:
                 continue
-            if calc.roi < MIN_ROI:
+            if calc.roi < _min_roi:
                 continue
 
             # Hardened mode: conservative profit check

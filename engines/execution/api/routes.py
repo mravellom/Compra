@@ -14,6 +14,7 @@ from ..infrastructure.execution_repository import ExecutionRepository
 from ..infrastructure.redis_publisher import ExecutionEventPublisher
 from .schemas import (
     ApprovalRequest,
+    CompleteTradeRequest,
     CreateOrderRequest,
     ExecutionResultOut,
     OrderOut,
@@ -147,6 +148,47 @@ async def risk_assessment(
     service = _get_service()
     assessment = await service.get_risk_assessment(product_id, price, quantity)
     return RiskAssessmentOut(**assessment.model_dump())
+
+
+@router.post("/orders/{order_id}/complete")
+async def complete_trade(order_id: int, request: CompleteTradeRequest):
+    """Report actual trade prices (closes the truth engine feedback loop).
+
+    Call this when a trade completes to record real buy/sell prices.
+    The truth engine uses this data to adapt detection thresholds.
+    """
+    service = _get_service()
+    order = await service.get_order(order_id)
+    if order is None:
+        raise HTTPException(404, f"Order {order_id} not found")
+
+    if not order.opportunity_id:
+        raise HTTPException(400, "Order has no linked opportunity")
+
+    try:
+        from truth_engine.integration import truth_engine_integration
+        await truth_engine_integration.on_order_completed(
+            opportunity_id=order.opportunity_id,
+            buy_price_actual=request.buy_price_actual,
+            sell_price_actual=request.sell_price_actual,
+        )
+    except Exception as e:
+        logger.error("Truth engine complete error: %s", e)
+        raise HTTPException(500, f"Failed to record outcome: {e}")
+
+    actual_profit = request.sell_price_actual - request.buy_price_actual
+    return {
+        "order_id": order_id,
+        "opportunity_id": order.opportunity_id,
+        "estimated_profit": order.estimated_profit,
+        "actual_profit": round(actual_profit, 2),
+        "deviation_pct": round(
+            ((actual_profit - order.estimated_profit) / order.estimated_profit * 100)
+            if order.estimated_profit > 0 else 0.0,
+            2,
+        ),
+        "status": "completed",
+    }
 
 
 def _order_to_out(order) -> OrderOut:

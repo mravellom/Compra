@@ -147,9 +147,9 @@ class ExecutionService:
         await self._repo.update_order(order)
         await self._repo.log_event(order_id, "executing", old_status, "executing")
 
-        # Create and run command
+        # Create and run command (async — supports real marketplace calls)
         command = create_command(order)
-        result = command.execute()
+        result = await command.execute()
 
         # Update based on result
         if result.success:
@@ -174,6 +174,30 @@ class ExecutionService:
                 "status": order.status.value,
             })
 
+        # ── Truth Engine: track execution outcome ────────
+        try:
+            from truth_engine.integration import truth_engine_integration
+            if result.success:
+                await truth_engine_integration.on_order_executed(
+                    opportunity_id=order.opportunity_id or 0,
+                    detected_at=order.created_at or datetime.now(timezone.utc),
+                    buy_price_predicted=order.price,
+                    sell_price_predicted=order.estimated_profit + order.price,
+                    estimated_profit=order.estimated_profit,
+                    expected_roi=(
+                        order.estimated_profit / order.price
+                        if order.price > 0 else 0.0
+                    ),
+                    buy_marketplace=order.marketplace,
+                )
+            else:
+                await truth_engine_integration.on_order_failed(
+                    opportunity_id=order.opportunity_id or 0,
+                    reason=result.error_message or "execution_failed",
+                )
+        except Exception as e:
+            logger.warning("Truth engine tracking error: %s", e)
+
         return result
 
     async def cancel_order(self, order_id: int) -> TradeOrder:
@@ -183,7 +207,7 @@ class ExecutionService:
             raise ValueError(f"Order {order_id} not found")
 
         cancel_cmd = CancelCommand(order)
-        result = cancel_cmd.execute()
+        result = await cancel_cmd.execute()
 
         if not result.success:
             raise ValueError(result.error_message or "Cannot cancel order")
@@ -194,6 +218,18 @@ class ExecutionService:
         await self._repo.log_event(
             order_id, "cancelled", old_status, "cancelled",
         )
+
+        # Truth Engine: record cancellation
+        try:
+            from truth_engine.integration import truth_engine_integration
+            if order.opportunity_id:
+                await truth_engine_integration.on_order_failed(
+                    opportunity_id=order.opportunity_id,
+                    reason="cancelled_by_user",
+                )
+        except Exception as e:
+            logger.warning("Truth engine cancel tracking error: %s", e)
+
         return order
 
     async def get_order(self, order_id: int) -> Optional[TradeOrder]:

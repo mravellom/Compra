@@ -76,10 +76,16 @@ async def lifespan(app: FastAPI):
     health_alerter_task = asyncio.create_task(health_alerter_instance.start())
     logger.info("Health alerter started")
 
+    # Start truth engine integration (adaptive thresholds + feedback loop)
+    from truth_engine.integration import truth_engine_integration
+    await truth_engine_integration.start()
+    logger.info("Truth Engine integration started (adaptive thresholds active)")
+
     scan_task = asyncio.create_task(_auto_scan_loop())
     logger.info("Auto-scan started (every %ds)", SCAN_INTERVAL)
     yield
     scan_task.cancel()
+    await truth_engine_integration.stop()
     await health_alerter_instance.stop()
     health_alerter_task.cancel()
     if monitor_task:

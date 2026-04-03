@@ -2,7 +2,11 @@
 
 Each command encapsulates a trade action with execute/validate logic.
 Commands are dispatched by the ExecutionService.
+
+Now supports REAL marketplace execution via MarketplaceClient.
+Falls back to simulation mode if no client is configured.
 """
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -11,6 +15,12 @@ from .enums import OrderType
 from .models import ExecutionResult, TradeOrder
 
 logger = logging.getLogger(__name__)
+
+
+def _get_marketplace_client(marketplace: str):
+    """Lazy import to avoid circular dependencies."""
+    from ..infrastructure.marketplace_factory import get_marketplace_client
+    return get_marketplace_client(marketplace)
 
 
 class TradeCommand(ABC):
@@ -25,7 +35,7 @@ class TradeCommand(ABC):
         ...
 
     @abstractmethod
-    def execute(self) -> ExecutionResult:
+    async def execute(self) -> ExecutionResult:
         """Execute the trade action."""
         ...
 
@@ -41,15 +51,15 @@ class TradeCommand(ABC):
 class BuyCommand(TradeCommand):
     """Execute a buy order on the source marketplace.
 
-    In a real system, this would integrate with marketplace APIs.
-    Currently acts as a validated placeholder that records intent.
+    Integrates with real marketplace APIs when configured.
+    Falls back to simulation mode (logging only) if no client is available.
     """
 
     @property
     def command_type(self) -> OrderType:
         return OrderType.BUY
 
-    def execute(self) -> ExecutionResult:
+    async def execute(self) -> ExecutionResult:
         valid, reason = self.validate()
         if not valid:
             return ExecutionResult(
@@ -58,34 +68,97 @@ class BuyCommand(TradeCommand):
                 error_message=reason,
             )
 
-        # Marketplace API integration point
-        # In production: call marketplace SDK to place purchase order
+        client = _get_marketplace_client(self.order.marketplace)
+
+        if client is None:
+            # Simulation mode — no marketplace client configured
+            logger.warning(
+                "SIMULATION BUY: product=%d marketplace=%s price=%.2f qty=%d "
+                "(no marketplace client configured)",
+                self.order.product_id, self.order.marketplace,
+                self.order.price, self.order.quantity,
+            )
+            return ExecutionResult(
+                order_id=self.order.id or 0,
+                success=True,
+                executed_price=self.order.price,
+                fees=0.0,
+                metadata={
+                    "marketplace": self.order.marketplace,
+                    "executed_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "simulation",
+                },
+            )
+
+        # Real marketplace execution
+        listing_url = self.order.risk_assessment.get("listing_url", "")
+        if not listing_url:
+            # Try to find listing URL from metadata
+            listing_url = str(self.order.risk_assessment.get("buy_url", ""))
+
         logger.info(
-            "BUY executed: product=%d marketplace=%s price=%.2f qty=%d",
+            "REAL BUY: product=%d marketplace=%s price=%.2f qty=%d url=%s",
             self.order.product_id, self.order.marketplace,
-            self.order.price, self.order.quantity,
+            self.order.price, self.order.quantity, listing_url[:80],
         )
 
-        return ExecutionResult(
-            order_id=self.order.id or 0,
-            success=True,
-            executed_price=self.order.price,
-            fees=0.0,  # would come from marketplace API response
-            metadata={
-                "marketplace": self.order.marketplace,
-                "executed_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        try:
+            result = await client.place_buy_order(
+                listing_url=listing_url,
+                quantity=self.order.quantity,
+                max_price=self.order.price * 1.05,  # Allow 5% slippage
+            )
+
+            if result.success:
+                logger.info(
+                    "BUY SUCCESS: order_id=%s price=%.2f fees=%.2f",
+                    result.marketplace_order_id, result.executed_price, result.fees,
+                )
+            else:
+                logger.warning(
+                    "BUY FAILED: %s", result.error_message,
+                )
+
+            return ExecutionResult(
+                order_id=self.order.id or 0,
+                success=result.success,
+                executed_price=result.executed_price,
+                fees=result.fees,
+                error_message=result.error_message,
+                metadata={
+                    "marketplace": self.order.marketplace,
+                    "marketplace_order_id": result.marketplace_order_id or "",
+                    "executed_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "real",
+                    **result.metadata,
+                },
+            )
+
+        except Exception as e:
+            logger.error(
+                "BUY ERROR: product=%d marketplace=%s error=%s",
+                self.order.product_id, self.order.marketplace, str(e),
+                exc_info=True,
+            )
+            return ExecutionResult(
+                order_id=self.order.id or 0,
+                success=False,
+                error_message=f"Marketplace API error: {str(e)}",
+                metadata={"marketplace": self.order.marketplace, "mode": "real"},
+            )
 
 
 class SellCommand(TradeCommand):
-    """Execute a sell/list order on the target marketplace."""
+    """Execute a sell/list order on the target marketplace.
+
+    Creates a real listing when marketplace client is configured.
+    """
 
     @property
     def command_type(self) -> OrderType:
         return OrderType.SELL
 
-    def execute(self) -> ExecutionResult:
+    async def execute(self) -> ExecutionResult:
         valid, reason = self.validate()
         if not valid:
             return ExecutionResult(
@@ -94,22 +167,84 @@ class SellCommand(TradeCommand):
                 error_message=reason,
             )
 
+        client = _get_marketplace_client(self.order.marketplace)
+
+        if client is None:
+            logger.warning(
+                "SIMULATION SELL: product=%d marketplace=%s price=%.2f qty=%d "
+                "(no marketplace client configured)",
+                self.order.product_id, self.order.marketplace,
+                self.order.price, self.order.quantity,
+            )
+            return ExecutionResult(
+                order_id=self.order.id or 0,
+                success=True,
+                executed_price=self.order.price,
+                fees=0.0,
+                metadata={
+                    "marketplace": self.order.marketplace,
+                    "executed_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "simulation",
+                },
+            )
+
+        # Real listing creation
+        title = self.order.risk_assessment.get("product_title", f"Product {self.order.product_id}")
+        description = self.order.risk_assessment.get("description", "")
+        images = self.order.risk_assessment.get("images", [])
+        category_id = self.order.risk_assessment.get("category_id")
+
         logger.info(
-            "SELL executed: product=%d marketplace=%s price=%.2f qty=%d",
+            "REAL SELL: product=%d marketplace=%s price=%.2f qty=%d title=%s",
             self.order.product_id, self.order.marketplace,
-            self.order.price, self.order.quantity,
+            self.order.price, self.order.quantity, title[:50],
         )
 
-        return ExecutionResult(
-            order_id=self.order.id or 0,
-            success=True,
-            executed_price=self.order.price,
-            fees=0.0,
-            metadata={
-                "marketplace": self.order.marketplace,
-                "executed_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        try:
+            result = await client.place_sell_listing(
+                title=title,
+                price=self.order.price,
+                quantity=self.order.quantity,
+                category_id=category_id,
+                description=description,
+                images=images,
+            )
+
+            if result.success:
+                logger.info(
+                    "SELL SUCCESS: listing_id=%s price=%.2f fees=%.2f",
+                    result.marketplace_order_id, result.executed_price, result.fees,
+                )
+            else:
+                logger.warning("SELL FAILED: %s", result.error_message)
+
+            return ExecutionResult(
+                order_id=self.order.id or 0,
+                success=result.success,
+                executed_price=result.executed_price,
+                fees=result.fees,
+                error_message=result.error_message,
+                metadata={
+                    "marketplace": self.order.marketplace,
+                    "marketplace_order_id": result.marketplace_order_id or "",
+                    "executed_at": datetime.now(timezone.utc).isoformat(),
+                    "mode": "real",
+                    **result.metadata,
+                },
+            )
+
+        except Exception as e:
+            logger.error(
+                "SELL ERROR: product=%d marketplace=%s error=%s",
+                self.order.product_id, self.order.marketplace, str(e),
+                exc_info=True,
+            )
+            return ExecutionResult(
+                order_id=self.order.id or 0,
+                success=False,
+                error_message=f"Marketplace API error: {str(e)}",
+                metadata={"marketplace": self.order.marketplace, "mode": "real"},
+            )
 
 
 class CancelCommand(TradeCommand):
@@ -125,7 +260,7 @@ class CancelCommand(TradeCommand):
             return False, f"Cannot cancel order in {self.order.status.value} state"
         return True, ""
 
-    def execute(self) -> ExecutionResult:
+    async def execute(self) -> ExecutionResult:
         valid, reason = self.validate()
         if not valid:
             return ExecutionResult(
@@ -133,6 +268,18 @@ class CancelCommand(TradeCommand):
                 success=False,
                 error_message=reason,
             )
+
+        # Try real cancellation if marketplace order exists
+        marketplace_order_id = self.order.risk_assessment.get("marketplace_order_id")
+        if marketplace_order_id:
+            client = _get_marketplace_client(self.order.marketplace)
+            if client:
+                try:
+                    cancelled = await client.cancel_order(marketplace_order_id)
+                    if not cancelled:
+                        logger.warning("Marketplace cancel failed for %s", marketplace_order_id)
+                except Exception as e:
+                    logger.error("Cancel error: %s", e)
 
         logger.info("Order %d cancelled", self.order.id or 0)
 
@@ -147,7 +294,7 @@ class CancelCommand(TradeCommand):
 COMMAND_REGISTRY: dict[OrderType, type[TradeCommand]] = {
     OrderType.BUY: BuyCommand,
     OrderType.SELL: SellCommand,
-    OrderType.LIST_ITEM: SellCommand,  # list_item uses same logic as sell
+    OrderType.LIST_ITEM: SellCommand,
 }
 
 

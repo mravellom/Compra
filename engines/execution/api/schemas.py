@@ -69,3 +69,9 @@ class RiskAssessmentOut(BaseModel):
     guards_passed: list[str] = Field(default_factory=list)
     guards_failed: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
+
+
+class CompleteTradeRequest(BaseModel):
+    """Report actual trade outcome (closes the feedback loop)."""
+    buy_price_actual: float = Field(gt=0)
+    sell_price_actual: float = Field(gt=0)
